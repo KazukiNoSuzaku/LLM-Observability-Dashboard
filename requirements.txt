@@ -1,0 +1,35 @@
+# Core web framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# LLM provider
+anthropic>=0.26.0
+
+# Database
+sqlalchemy>=2.0.0
+aiosqlite>=0.19.0
+
+# Configuration & validation
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# OpenTelemetry (distributed tracing)
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+opentelemetry-exporter-otlp-proto-http>=1.20.0
+
+# Arize Phoenix (tracing visualization — optional but recommended)
+arize-phoenix>=4.0.0
+
+# Dashboard
+streamlit>=1.29.0
+plotly>=5.18.0
+pandas>=2.1.0
+numpy>=1.26.0
+
+# HTTP client
+httpx>=0.25.0
+
+# Form data parsing (FastAPI)
+python-multipart>=0.0.6
