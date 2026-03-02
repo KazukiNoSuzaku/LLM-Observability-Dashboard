@@ -2,13 +2,97 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text
-
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import DeclarativeBase, relationship
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class PromptTemplate(Base):
+    """Versioned prompt template registry.
+
+    Each row is one immutable version of a named template.
+    Versions are auto-incremented integers (1, 2, 3 …) scoped to ``name``.
+
+    Example::
+
+        name="summarizer"  version=1  content="Summarize: {text}"
+        name="summarizer"  version=2  content="Give a concise summary of: {text}. Max 3 sentences."
+    """
+
+    __tablename__ = "prompt_templates"
+    __table_args__ = (
+        UniqueConstraint("name", "version", name="uq_prompt_template_name_version"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # ------------------------------------------------------------------ #
+    # Identity
+    # ------------------------------------------------------------------ #
+    name = Column(
+        String(100),
+        nullable=False,
+        index=True,
+        comment="Logical template name, e.g. 'summarizer' or 'code-reviewer'",
+    )
+    version = Column(
+        Integer,
+        nullable=False,
+        comment="Auto-incremented version number, scoped to name",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Content
+    # ------------------------------------------------------------------ #
+    content = Column(
+        Text,
+        nullable=False,
+        comment="Template body. Use {variable} placeholders for substitution.",
+    )
+    system_prompt = Column(
+        Text,
+        nullable=True,
+        comment="Optional system-level instruction shipped with this template",
+    )
+    description = Column(
+        String(500),
+        nullable=True,
+        comment="Human-readable changelog / notes for this version",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle
+    # ------------------------------------------------------------------ #
+    created_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    is_active = Column(
+        Boolean,
+        nullable=False,
+        default=True,
+        comment="Soft-delete flag — deactivated versions are hidden by default",
+    )
+
+    # Relationship back to requests (lazy loaded)
+    requests = relationship("LLMRequest", back_populates="prompt_template", lazy="dynamic")
+
+    def __repr__(self) -> str:
+        return f"<PromptTemplate name={self.name!r} v{self.version} active={self.is_active}>"
 
 
 class LLMRequest(Base):
@@ -99,6 +183,38 @@ class LLMRequest(Base):
         index=True,
         comment="UUID linking this DB row to an OTel/Phoenix trace",
     )
+
+    # ------------------------------------------------------------------ #
+    # Prompt version control
+    # ------------------------------------------------------------------ #
+    prompt_template_id = Column(
+        Integer,
+        ForeignKey("prompt_templates.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="FK to the PromptTemplate used to generate this request",
+    )
+    # Denormalised copies for fast filtering without joins
+    prompt_template_name = Column(
+        String(100),
+        nullable=True,
+        index=True,
+        comment="Denormalised template name for zero-join queries",
+    )
+    prompt_template_version = Column(
+        Integer,
+        nullable=True,
+        index=True,
+        comment="Denormalised template version for zero-join queries",
+    )
+    prompt_variables = Column(
+        Text,
+        nullable=True,
+        comment="JSON-encoded dict of variables substituted into the template",
+    )
+
+    # Relationship to template
+    prompt_template = relationship("PromptTemplate", back_populates="requests")
 
     def __repr__(self) -> str:
         return (

@@ -12,7 +12,10 @@ from llm_observability.api.schemas import (
     GenerateResponse,
     LLMRequestResponse,
     MetricsSummaryResponse,
+    PromptTemplateCreate,
+    PromptTemplateResponse,
     TimeSeriesBucket,
+    VersionComparisonRow,
 )
 from llm_observability.core.llm_wrapper import ObservedLLM
 from llm_observability.db import crud
@@ -34,8 +37,8 @@ router = APIRouter()
     response_model=GenerateResponse,
     summary="Generate an LLM completion",
     description=(
-        "Send a prompt to the configured LLM model. "
-        "Latency, token usage, cost, and tracing are captured automatically."
+        "Send a prompt (raw or from a versioned template) to the LLM. "
+        "Latency, token usage, cost, tracing, and prompt version are captured automatically."
     ),
 )
 async def generate(
@@ -45,6 +48,9 @@ async def generate(
     llm = ObservedLLM(model=request.model)
     result = await llm.generate(
         prompt=request.prompt,
+        template_name=request.template_name,
+        template_version=request.template_version,
+        variables=request.variables,
         system=request.system,
         feedback_score=request.feedback_score,
     )
@@ -64,11 +70,10 @@ async def generate(
     "/metrics/summary",
     response_model=MetricsSummaryResponse,
     summary="Aggregate metrics summary",
-    description="Returns avg/p50/p95 latency, total cost, token usage, and error rate.",
 )
 async def get_metrics_summary(
-    hours: int = Query(default=24, ge=1, le=720, description="Rolling window in hours"),
-    model: Optional[str] = Query(default=None, description="Filter by model name"),
+    hours: int = Query(default=24, ge=1, le=720),
+    model: Optional[str] = Query(default=None),
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> MetricsSummaryResponse:
     summary = await crud.get_metrics_summary(db, hours=hours, model_name=model)
@@ -84,13 +89,12 @@ async def get_metrics_summary(
     "/metrics/requests",
     response_model=List[LLMRequestResponse],
     summary="Paginated request log",
-    description="Returns individual LLM request records, newest first.",
 )
 async def get_requests(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=1000),
-    model: Optional[str] = Query(default=None, description="Filter by model name"),
-    hours: int = Query(default=24, ge=1, le=720, description="Rolling window in hours"),
+    model: Optional[str] = Query(default=None),
+    hours: int = Query(default=24, ge=1, le=720),
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> List[LLMRequestResponse]:
     rows = await crud.get_requests(
@@ -107,7 +111,6 @@ async def get_requests(
 @router.post(
     "/metrics/requests/{request_id}/feedback",
     summary="Submit quality feedback",
-    description="Attach a 0–1 quality score to a previously logged request.",
 )
 async def add_feedback(
     request_id: int,
@@ -129,16 +132,10 @@ async def add_feedback(
     "/metrics/timeseries",
     response_model=List[TimeSeriesBucket],
     summary="Time-series metrics",
-    description=(
-        "Returns per-bucket aggregates suitable for rendering latency, "
-        "cost, and token charts."
-    ),
 )
 async def get_timeseries(
-    hours: int = Query(default=24, ge=1, le=720, description="Rolling window in hours"),
-    bucket_minutes: int = Query(
-        default=5, ge=1, le=60, description="Bucket width in minutes"
-    ),
+    hours: int = Query(default=24, ge=1, le=720),
+    bucket_minutes: int = Query(default=5, ge=1, le=60),
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> List[TimeSeriesBucket]:
     data = await MetricsService.get_timeseries(
@@ -152,13 +149,108 @@ async def get_timeseries(
 # ============================================================================ #
 
 
-@router.get(
-    "/metrics/models",
-    summary="Per-model breakdown",
-    description="Returns aggregated metrics grouped by model name.",
-)
+@router.get("/metrics/models", summary="Per-model breakdown")
 async def get_model_breakdown(
     hours: int = Query(default=24, ge=1, le=720),
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> list:
     return await MetricsService.get_model_breakdown(db, hours=hours)
+
+
+# ============================================================================ #
+# Prompt version control
+# ============================================================================ #
+
+
+@router.post(
+    "/prompts",
+    response_model=PromptTemplateResponse,
+    status_code=201,
+    summary="Create a new prompt template version",
+    description=(
+        "Each call creates the next version for the given ``name``. "
+        "First call → v1, second call with same name → v2, etc."
+    ),
+)
+async def create_prompt_template(
+    body: PromptTemplateCreate,
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> PromptTemplateResponse:
+    tpl = await crud.create_prompt_template(
+        db,
+        name=body.name,
+        content=body.content,
+        system_prompt=body.system_prompt,
+        description=body.description,
+    )
+    return PromptTemplateResponse.model_validate(tpl)
+
+
+@router.get(
+    "/prompts",
+    response_model=List[PromptTemplateResponse],
+    summary="List all prompt templates",
+    description="Returns all active template versions, grouped by name.",
+)
+async def list_prompt_templates(
+    name: Optional[str] = Query(default=None, description="Filter by template name"),
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> List[PromptTemplateResponse]:
+    templates = await crud.get_prompt_templates(db, name=name)
+    return [PromptTemplateResponse.model_validate(t) for t in templates]
+
+
+@router.get(
+    "/prompts/{name}",
+    response_model=List[PromptTemplateResponse],
+    summary="Get all versions of a named template",
+)
+async def get_prompt_template_versions(
+    name: str,
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> List[PromptTemplateResponse]:
+    templates = await crud.get_prompt_templates(db, name=name, active_only=False)
+    if not templates:
+        raise HTTPException(status_code=404, detail=f"Template '{name}' not found")
+    return [PromptTemplateResponse.model_validate(t) for t in templates]
+
+
+@router.get(
+    "/prompts/{name}/compare",
+    response_model=List[VersionComparisonRow],
+    summary="Compare metrics across template versions",
+    description=(
+        "Returns per-version aggregates (latency, cost, feedback, error rate) "
+        "so you can measure the impact of prompt changes."
+    ),
+)
+async def compare_prompt_versions(
+    name: str,
+    hours: int = Query(default=24, ge=1, le=720),
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> List[VersionComparisonRow]:
+    data = await crud.get_version_comparison(db, name=name, hours=hours)
+    if not data:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No request data found for template '{name}' in the last {hours}h",
+        )
+    return [VersionComparisonRow(**row) for row in data]
+
+
+@router.delete(
+    "/prompts/{name}/{version}",
+    summary="Deactivate a template version",
+    description="Soft-deletes a version — it remains in the DB but is excluded from active lookups.",
+)
+async def deactivate_prompt_template(
+    name: str,
+    version: int,
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> dict:
+    ok = await crud.deactivate_prompt_template(db, name=name, version=version)
+    if not ok:
+        raise HTTPException(
+            status_code=404, detail=f"Template '{name}' v{version} not found"
+        )
+    return {"status": "deactivated", "name": name, "version": version}

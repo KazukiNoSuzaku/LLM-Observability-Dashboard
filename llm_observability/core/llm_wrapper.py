@@ -1,14 +1,16 @@
 """ObservedLLM — instrumented wrapper around the Anthropic Messages API.
 
 Every call to ``generate()`` automatically:
-  1. Records wall-clock latency.
-  2. Extracts token usage from the API response.
-  3. Calculates estimated cost using model pricing tables.
-  4. Emits an OpenTelemetry span (forwarded to Arize Phoenix if configured).
-  5. Persists the full trace record to the database.
-  6. Logs WARNING-level alerts when latency or cost thresholds are breached.
+  1. Resolves a versioned prompt template (if provided) and renders variables.
+  2. Records wall-clock latency.
+  3. Extracts token usage from the API response.
+  4. Calculates estimated cost using model pricing tables.
+  5. Emits an OpenTelemetry span (forwarded to Arize Phoenix if configured).
+  6. Persists the full trace record (including template provenance) to the DB.
+  7. Logs WARNING-level alerts when latency or cost thresholds are breached.
 """
 
+import json
 import logging
 import time
 import uuid
@@ -26,14 +28,21 @@ logger = logging.getLogger(__name__)
 
 
 class ObservedLLM:
-    """Async LLM client with built-in observability.
+    """Async LLM client with built-in observability and prompt version control.
 
-    Example::
+    Raw prompt example::
 
-        llm = ObservedLLM(model="claude-haiku-4-5-20251001")
+        llm = ObservedLLM()
         result = await llm.generate("Explain async/await in Python.")
-        print(result["response"])
-        print(f"Cost: ${result['estimated_cost']:.6f}  Latency: {result['latency_ms']:.0f}ms")
+
+    Template example::
+
+        result = await llm.generate(
+            template_name="code-reviewer",
+            variables={"language": "Python", "code": "def foo(): pass"},
+        )
+        # result["prompt_template_name"]    → "code-reviewer"
+        # result["prompt_template_version"] → 2
     """
 
     def __init__(
@@ -52,25 +61,57 @@ class ObservedLLM:
 
     async def generate(
         self,
-        prompt: str,
+        prompt: Optional[str] = None,
         *,
+        # Prompt version control
+        template_name: Optional[str] = None,
+        template_version: Optional[int] = None,
+        variables: Optional[Dict[str, str]] = None,
+        # Common options
         system: Optional[str] = None,
         feedback_score: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Send a prompt to the LLM and return an enriched result dict.
+        """Generate a completion with full observability instrumentation.
 
         Args:
-            prompt:         User message.
-            system:         Optional system-level instruction.
-            feedback_score: Pre-assigned quality label (0.0 – 1.0).
+            prompt:           Raw user message.  Mutually exclusive with template_name.
+            template_name:    Name of a registered PromptTemplate to use.
+            template_version: Pin to a specific version; omit to use the latest.
+            variables:        Dict of ``{placeholder: value}`` for template rendering.
+            system:           Override the template's system prompt.
+            feedback_score:   Pre-assigned quality label (0.0 – 1.0).
 
         Returns:
-            A dict with keys: response, model, latency_ms, prompt_tokens,
-            completion_tokens, total_tokens, estimated_cost, trace_id, error.
-
-        Raises:
-            anthropic.APIError: Re-raised after the trace record is stored.
+            Dict with: response, model, latency_ms, prompt_tokens, completion_tokens,
+            total_tokens, estimated_cost, trace_id, error,
+            prompt_template_name, prompt_template_version.
         """
+        if not prompt and not template_name:
+            raise ValueError("Provide either 'prompt' or 'template_name'")
+
+        # ---- resolve template ----------------------------------------- #
+        template_id: Optional[int] = None
+        tpl_name: Optional[str] = None
+        tpl_version: Optional[int] = None
+
+        if template_name:
+            async with AsyncSessionLocal() as db:
+                tpl = await crud.get_prompt_template(
+                    db, name=template_name, version=template_version
+                )
+            if tpl is None:
+                ver_str = f" v{template_version}" if template_version else " (latest)"
+                raise ValueError(
+                    f"Prompt template '{template_name}'{ver_str} not found or inactive"
+                )
+            template_id = tpl.id
+            tpl_name = tpl.name
+            tpl_version = tpl.version
+            prompt = self._render_template(tpl.content, variables or {})
+            if system is None and tpl.system_prompt:
+                system = tpl.system_prompt
+
+        # ---- instrumented generation ---------------------------------- #
         trace_id = str(uuid.uuid4())
         start_time = time.monotonic()
 
@@ -79,15 +120,16 @@ class ObservedLLM:
         prompt_tokens = 0
         completion_tokens = 0
 
-        with self._tracer.start_as_current_span(
-            "llm.generate",
-            attributes={
-                "llm.model": self.model,
-                "llm.prompt_length": len(prompt),
-                "llm.max_tokens": self.max_tokens,
-                "llm.trace_id": trace_id,
-            },
-        ) as span:
+        span_attrs: Dict[str, Any] = {
+            "llm.model": self.model,
+            "llm.prompt_length": len(prompt),
+            "llm.max_tokens": self.max_tokens,
+            "llm.trace_id": trace_id,
+        }
+        if tpl_name:
+            span_attrs["llm.prompt_template"] = f"{tpl_name}:v{tpl_version}"
+
+        with self._tracer.start_as_current_span("llm.generate", attributes=span_attrs) as span:
             try:
                 messages = [{"role": "user", "content": prompt}]
                 call_kwargs: Dict[str, Any] = {
@@ -125,7 +167,6 @@ class ObservedLLM:
                 span.set_attribute("llm.total_tokens", total_tokens)
                 span.set_attribute("llm.estimated_cost_usd", estimated_cost)
 
-                # Persist to database
                 async with AsyncSessionLocal() as db:
                     await crud.create_request(
                         db=db,
@@ -141,9 +182,14 @@ class ObservedLLM:
                         is_error=error_text is not None,
                         trace_id=trace_id,
                         feedback_score=feedback_score,
+                        prompt_template_id=template_id,
+                        prompt_template_name=tpl_name,
+                        prompt_template_version=tpl_version,
+                        prompt_variables=(
+                            json.dumps(variables) if variables else None
+                        ),
                     )
 
-                # Alert checks
                 self._check_alerts(latency_ms=latency_ms, cost=estimated_cost)
 
         return {
@@ -156,11 +202,27 @@ class ObservedLLM:
             "estimated_cost": estimated_cost,
             "trace_id": trace_id,
             "error": error_text,
+            "prompt_template_name": tpl_name,
+            "prompt_template_version": tpl_version,
         }
 
     # ------------------------------------------------------------------ #
     # Private helpers
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _render_template(content: str, variables: Dict[str, str]) -> str:
+        """Substitute {placeholders} in a template with provided values.
+
+        Raises:
+            ValueError: If a required placeholder is missing from variables.
+        """
+        try:
+            return content.format_map(variables)
+        except KeyError as exc:
+            raise ValueError(
+                f"Template variable {exc} was not supplied in 'variables'"
+            ) from exc
 
     def _check_alerts(self, *, latency_ms: float, cost: float) -> None:
         """Log WARNING when observability thresholds are breached."""

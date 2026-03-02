@@ -1,31 +1,114 @@
 """Pydantic request/response schemas for the FastAPI layer."""
 
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ============================================================================ #
-# Request schemas
+# Prompt template schemas
+# ============================================================================ #
+
+
+class PromptTemplateCreate(BaseModel):
+    """Payload for POST /api/v1/prompts — creates the next version."""
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[a-z0-9\-_]+$",
+        description="Template name (lowercase, hyphens/underscores allowed). "
+        "Repeated calls with the same name auto-increment the version.",
+    )
+    content: str = Field(
+        ...,
+        min_length=1,
+        description="Template body. Use {variable} placeholders, e.g. 'Summarize: {text}'",
+    )
+    system_prompt: Optional[str] = Field(
+        None, description="Optional system instruction bundled with this template"
+    )
+    description: Optional[str] = Field(
+        None,
+        max_length=500,
+        description="Human-readable changelog entry / notes for this version",
+    )
+
+
+class PromptTemplateResponse(BaseModel):
+    """One template version returned by the API."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    version: int
+    content: str
+    system_prompt: Optional[str]
+    description: Optional[str]
+    created_at: datetime
+    is_active: bool
+
+
+class VersionComparisonRow(BaseModel):
+    """Per-version aggregate from GET /api/v1/prompts/{name}/compare."""
+
+    version: int
+    request_count: int
+    avg_latency_ms: float
+    p95_latency_ms: float
+    total_cost: float
+    avg_cost: float
+    total_tokens: int
+    avg_feedback: Optional[float]
+    error_count: int
+    error_rate_pct: float
+
+
+# ============================================================================ #
+# LLM generation schemas
 # ============================================================================ #
 
 
 class GenerateRequest(BaseModel):
-    """Payload for POST /api/v1/generate."""
+    """Payload for POST /api/v1/generate.
 
-    prompt: str = Field(..., min_length=1, description="User message sent to the LLM")
-    system: Optional[str] = Field(None, description="Optional system-level instruction")
-    model: Optional[str] = Field(
-        None,
-        description="Override the default model (e.g. claude-sonnet-4-6)",
+    Supply either ``prompt`` (raw text) **or** ``template_name`` + optional
+    ``variables`` dict.  Both cannot be absent simultaneously.
+    """
+
+    # Raw prompt path
+    prompt: Optional[str] = Field(
+        None, min_length=1, description="Raw user message sent directly to the LLM"
     )
+
+    # Template path
+    template_name: Optional[str] = Field(
+        None,
+        description="Name of a registered PromptTemplate (uses the latest active version)",
+    )
+    template_version: Optional[int] = Field(
+        None, ge=1, description="Pin to a specific version; omit to use latest"
+    )
+    variables: Optional[Dict[str, str]] = Field(
+        None,
+        description="Values to substitute into template {placeholders}",
+    )
+
+    # Shared options
+    system: Optional[str] = Field(None, description="Override the template's system prompt")
+    model: Optional[str] = Field(None, description="Override the default model")
     feedback_score: Optional[float] = Field(
-        None,
-        ge=0.0,
-        le=1.0,
-        description="Pre-assigned quality label (0 = worst, 1 = best)",
+        None, ge=0.0, le=1.0, description="Pre-assigned quality label (0–1)"
     )
+
+    @model_validator(mode="after")
+    def _require_prompt_or_template(self) -> "GenerateRequest":
+        if not self.prompt and not self.template_name:
+            raise ValueError("Provide either 'prompt' or 'template_name'")
+        return self
 
 
 class FeedbackRequest(BaseModel):
@@ -51,6 +134,9 @@ class GenerateResponse(BaseModel):
     estimated_cost: float = Field(..., description="Estimated cost in USD")
     trace_id: str
     error: Optional[str] = None
+    # Template provenance (null when raw prompt was used)
+    prompt_template_name: Optional[str] = None
+    prompt_template_version: Optional[int] = None
 
 
 class MetricsSummaryResponse(BaseModel):
@@ -87,6 +173,9 @@ class LLMRequestResponse(BaseModel):
     trace_id: Optional[str]
     prompt: str
     response: Optional[str]
+    # Template provenance
+    prompt_template_name: Optional[str] = None
+    prompt_template_version: Optional[int] = None
 
 
 class TimeSeriesBucket(BaseModel):

@@ -582,6 +582,262 @@ st.dataframe(
     },
 )
 
+# ===========================================================================
+# Prompt Version Control — A/B comparison panel
+# ===========================================================================
+
+st.divider()
+st.markdown("## 🔀 Prompt Version Control")
+st.caption(
+    "Compare latency, cost, and quality across versions of the same prompt template. "
+    "Create templates via `POST /api/v1/prompts` or run `make seed`."
+)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_template_names() -> list:
+    if not os.path.exists(DB_PATH):
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df_t = pd.read_sql_query(
+            "SELECT DISTINCT name FROM prompt_templates WHERE is_active = 1 ORDER BY name",
+            conn,
+        )
+        return df_t["name"].tolist()
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def load_version_metrics(template_name: str, hours: int) -> pd.DataFrame:
+    if not os.path.exists(DB_PATH):
+        return pd.DataFrame()
+    since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        query = """
+            SELECT
+                prompt_template_version                                AS version,
+                COUNT(*)                                               AS request_count,
+                AVG(CASE WHEN is_error = 0 THEN latency_ms END)       AS avg_latency_ms,
+                SUM(COALESCE(estimated_cost, 0))                       AS total_cost,
+                AVG(COALESCE(estimated_cost, 0))                       AS avg_cost,
+                AVG(feedback_score)                                    AS avg_feedback,
+                SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END)         AS errors,
+                SUM(COALESCE(total_tokens, 0))                         AS total_tokens
+            FROM llm_requests
+            WHERE prompt_template_name = ?
+              AND timestamp >= ?
+              AND prompt_template_version IS NOT NULL
+            GROUP BY prompt_template_version
+            ORDER BY prompt_template_version
+        """
+        return pd.read_sql_query(query, conn, params=[template_name, since])
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_template_definitions(template_name: str) -> pd.DataFrame:
+    if not os.path.exists(DB_PATH):
+        return pd.DataFrame()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return pd.read_sql_query(
+            """SELECT version, content, system_prompt, description, created_at, is_active
+               FROM prompt_templates WHERE name = ? ORDER BY version""",
+            conn,
+            params=[template_name],
+        )
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+
+template_names = get_template_names()
+
+if not template_names:
+    st.info(
+        "No prompt templates yet. "
+        "Run `python scripts/seed_data.py` to generate sample templates, "
+        "or create one via `POST /api/v1/prompts`."
+    )
+else:
+    pvc_col1, pvc_col2 = st.columns([2, 1])
+    with pvc_col1:
+        selected_template = st.selectbox("Template to compare", template_names)
+    with pvc_col2:
+        pvc_hours = st.selectbox(
+            "Window",
+            [1, 6, 24, 48, 168],
+            index=2,
+            format_func=lambda x: {1: "1h", 6: "6h", 24: "24h", 48: "48h", 168: "7d"}[x],
+            key="pvc_hours",
+        )
+
+    comp_df = load_version_metrics(selected_template, pvc_hours)
+    defs_df = load_template_definitions(selected_template)
+
+    if comp_df.empty:
+        st.info(
+            f"No requests recorded for **{selected_template}** in the last {pvc_hours}h. "
+            "Seed data includes template-linked requests — run `make seed` to populate."
+        )
+    else:
+        comp_df["error_rate_pct"] = (
+            comp_df["errors"] / comp_df["request_count"] * 100
+        ).round(2)
+        comp_df["version_label"] = comp_df["version"].apply(lambda v: f"v{int(v)}")
+
+        # ---- KPI delta row -------------------------------------------- #
+        if len(comp_df) >= 2:
+            first = comp_df.iloc[0]
+            last = comp_df.iloc[-1]
+            d_lat = last["avg_latency_ms"] - first["avg_latency_ms"]
+            d_cost = last["avg_cost"] - first["avg_cost"]
+            d_fb = (
+                (last["avg_feedback"] - first["avg_feedback"])
+                if pd.notna(last["avg_feedback"]) and pd.notna(first["avg_feedback"])
+                else None
+            )
+            st.markdown(
+                f"**v1 → v{int(last['version'])} delta** — "
+                f"Latency: `{d_lat:+.0f}ms` · "
+                f"Avg cost: `${d_cost:+.8f}` · "
+                f"Feedback: `{d_fb:+.3f}`" if d_fb is not None else
+                f"**v1 → v{int(last['version'])} delta** — "
+                f"Latency: `{d_lat:+.0f}ms` · "
+                f"Avg cost: `${d_cost:+.8f}`"
+            )
+
+        # ---- bar charts ------------------------------------------------ #
+        vc1, vc2, vc3 = st.columns(3)
+        bar_colors = px.colors.qualitative.Set2
+
+        with vc1:
+            fig = px.bar(
+                comp_df,
+                x="version_label",
+                y="avg_latency_ms",
+                color="version_label",
+                color_discrete_sequence=bar_colors,
+                template=PLOTLY_TEMPLATE,
+                text=comp_df["avg_latency_ms"].round(0).astype(int).astype(str) + "ms",
+            )
+            fig.update_traces(textposition="outside")
+            fig.update_layout(
+                title="Avg Latency (ms)",
+                height=280,
+                margin=CHART_MARGIN,
+                showlegend=False,
+                xaxis_title=None,
+                yaxis_title="ms",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with vc2:
+            fig = px.bar(
+                comp_df,
+                x="version_label",
+                y="avg_cost",
+                color="version_label",
+                color_discrete_sequence=bar_colors,
+                template=PLOTLY_TEMPLATE,
+            )
+            fig.update_layout(
+                title="Avg Cost / Request (USD)",
+                height=280,
+                margin=CHART_MARGIN,
+                showlegend=False,
+                xaxis_title=None,
+                yaxis_title="USD",
+                yaxis_tickformat=".8f",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with vc3:
+            fb_data = comp_df.dropna(subset=["avg_feedback"])
+            if not fb_data.empty:
+                fig = px.bar(
+                    fb_data,
+                    x="version_label",
+                    y="avg_feedback",
+                    color="version_label",
+                    color_discrete_sequence=bar_colors,
+                    template=PLOTLY_TEMPLATE,
+                    text=fb_data["avg_feedback"].round(3).astype(str),
+                )
+                fig.update_traces(textposition="outside")
+                fig.update_layout(
+                    title="Avg Feedback Score",
+                    height=280,
+                    margin=CHART_MARGIN,
+                    showlegend=False,
+                    xaxis_title=None,
+                    yaxis=dict(title="score", range=[0, 1.1]),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.markdown("**Avg Feedback Score**")
+                st.info("No feedback scores for this template.")
+
+        # ---- summary table -------------------------------------------- #
+        st.markdown("**Version Summary**")
+        tbl = comp_df[
+            [
+                "version_label",
+                "request_count",
+                "avg_latency_ms",
+                "total_cost",
+                "avg_feedback",
+                "errors",
+                "error_rate_pct",
+                "total_tokens",
+            ]
+        ].copy()
+        tbl.columns = [
+            "Version",
+            "Requests",
+            "Avg Latency (ms)",
+            "Total Cost",
+            "Avg Feedback",
+            "Errors",
+            "Error Rate (%)",
+            "Total Tokens",
+        ]
+        tbl["Avg Latency (ms)"] = tbl["Avg Latency (ms)"].apply(
+            lambda x: f"{x:.0f}" if pd.notna(x) else "—"
+        )
+        tbl["Total Cost"] = tbl["Total Cost"].apply(
+            lambda x: f"${x:.6f}" if pd.notna(x) else "—"
+        )
+        tbl["Avg Feedback"] = tbl["Avg Feedback"].apply(
+            lambda x: f"{x:.3f}" if pd.notna(x) else "—"
+        )
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+        # ---- template content expanders ------------------------------- #
+        if not defs_df.empty:
+            st.markdown("**Template Content by Version**")
+            for _, row in defs_df.iterrows():
+                status = "" if row["is_active"] else " 🔴 inactive"
+                label = f"v{int(row['version'])}{status}"
+                if row["description"]:
+                    label += f"  —  {row['description']}"
+                with st.expander(label):
+                    if row["system_prompt"]:
+                        st.markdown("*System prompt:*")
+                        st.code(row["system_prompt"], language="text")
+                    st.markdown("*User template:*")
+                    st.code(row["content"], language="text")
+                    st.caption(f"Created: {row['created_at']}")
+
 # ---------------------------------------------------------------------------
 # Footer / Phoenix link
 # ---------------------------------------------------------------------------
