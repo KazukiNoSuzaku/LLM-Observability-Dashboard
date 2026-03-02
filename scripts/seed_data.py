@@ -306,7 +306,7 @@ async def seed() -> None:
     with_template = sum(1 for r in rows if r.prompt_template_name)
     total_cost = sum(r.estimated_cost for r in rows if r.estimated_cost)
 
-    print(f"✅  Seeded {NUM_RECORDS} request records:")
+    print(f"[OK] Seeded {NUM_RECORDS} request records:")
     print(f"   With template : {with_template} ({with_template / NUM_RECORDS * 100:.0f}%)")
     print(f"   Errors        : {errors} ({errors / NUM_RECORDS * 100:.1f}%)")
     print(f"   Total cost    : ${total_cost:.4f}")
