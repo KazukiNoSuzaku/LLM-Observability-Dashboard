@@ -6,6 +6,12 @@ Tracks every LLM request and surfaces latency, cost, token usage, error rates, a
 
 ---
 
+## Dashboard Preview
+
+![LLM Observability Dashboard](docs/screenshot.png)
+
+---
+
 ## Architecture
 
 ```
