@@ -70,6 +70,7 @@ async def _migrate_columns(conn) -> None:  # type: ignore[no-untyped-def]
         ("llm_requests", "prompt_template_name",    "VARCHAR(100)"),
         ("llm_requests", "prompt_template_version", "INTEGER"),
         ("llm_requests", "prompt_variables",        "TEXT"),
+        ("llm_requests", "provider",                "VARCHAR(50)"),
     ]
     for table, column, col_type in new_columns:
         try:

@@ -127,6 +127,7 @@ class GenerateResponse(BaseModel):
 
     response: Optional[str] = Field(None, description="LLM completion text")
     model: str
+    provider: Optional[str] = None
     latency_ms: float
     prompt_tokens: int
     completion_tokens: int
@@ -137,6 +138,45 @@ class GenerateResponse(BaseModel):
     # Template provenance (null when raw prompt was used)
     prompt_template_name: Optional[str] = None
     prompt_template_version: Optional[int] = None
+
+
+# ============================================================================ #
+# A/B test schemas
+# ============================================================================ #
+
+
+class ABTestRequest(BaseModel):
+    """Payload for POST /api/v1/prompts/{name}/ab-generate."""
+
+    prompt: str = Field(..., min_length=1, description="Prompt to test across both versions")
+    version_a: int = Field(..., ge=1, description="First template version")
+    version_b: int = Field(..., ge=1, description="Second template version")
+    variables: Optional[Dict[str, str]] = Field(
+        None, description="Variables to substitute into template placeholders"
+    )
+    system: Optional[str] = Field(None, description="Optional system prompt override")
+
+
+class ABTestResult(BaseModel):
+    """Result from a single version in an A/B test."""
+
+    version: int
+    response: Optional[str]
+    latency_ms: float
+    prompt_tokens: int
+    completion_tokens: int
+    estimated_cost: float
+    feedback_score: Optional[float]
+    error: Optional[str]
+    trace_id: str
+
+
+class ABTestResponse(BaseModel):
+    """Response from POST /api/v1/prompts/{name}/ab-generate."""
+
+    template_name: str
+    result_a: ABTestResult
+    result_b: ABTestResult
 
 
 class MetricsSummaryResponse(BaseModel):

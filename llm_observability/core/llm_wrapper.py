@@ -1,20 +1,28 @@
-"""ObservedLLM — instrumented wrapper around the Anthropic Messages API.
+"""ObservedLLM — instrumented wrapper around multiple LLM providers.
 
 Every call to ``generate()`` automatically:
-  1. Resolves a versioned prompt template (if provided) and renders variables.
-  2. Records wall-clock latency.
-  3. Extracts token usage from the API response.
-  4. Calculates estimated cost using model pricing tables.
-  5. Emits an OpenTelemetry span (forwarded to Arize Phoenix if configured).
-  6. Persists the full trace record (including template provenance) to the DB.
-  7. Logs WARNING-level alerts when latency or cost thresholds are breached.
+  1. Detects the provider from the model name and routes to the correct SDK.
+  2. Resolves a versioned prompt template (if provided) and renders variables.
+  3. Records wall-clock latency.
+  4. Extracts token usage from the API response.
+  5. Calculates estimated cost using model pricing tables.
+  6. Emits an OpenTelemetry span (forwarded to Arize Phoenix if configured).
+  7. Auto-scores the response with JudgeService (if JUDGE_ENABLED=true).
+  8. Persists the full trace record to the DB.
+  9. Fires async webhook alerts (Slack/Discord) when thresholds are breached.
+
+Supported providers
+-------------------
+  anthropic — any ``claude-*`` model
+  openai    — any ``gpt-*``, ``o1-*``, ``o3-*`` model
+  google    — any ``gemini-*`` model (requires ``google-genai`` package)
 """
 
 import json
 import logging
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import anthropic
 
@@ -27,13 +35,36 @@ from llm_observability.services.tracing_service import TracingService
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------------- #
+# Provider detection
+# --------------------------------------------------------------------------- #
+
+def _detect_provider(model_name: str) -> str:
+    """Infer the provider from the model name prefix."""
+    m = model_name.lower()
+    if m.startswith(("gpt-", "o1-", "o1", "o3-", "o3", "o4-")):
+        return "openai"
+    if m.startswith("gemini-"):
+        return "google"
+    return "anthropic"
+
+
+# --------------------------------------------------------------------------- #
+# ObservedLLM
+# --------------------------------------------------------------------------- #
+
 class ObservedLLM:
-    """Async LLM client with built-in observability and prompt version control.
+    """Async multi-provider LLM client with built-in observability.
 
     Raw prompt example::
 
         llm = ObservedLLM()
         result = await llm.generate("Explain async/await in Python.")
+
+    OpenAI model example::
+
+        llm = ObservedLLM(model="gpt-4o-mini")
+        result = await llm.generate("Summarise the Turing test.")
 
     Template example::
 
@@ -41,8 +72,6 @@ class ObservedLLM:
             template_name="code-reviewer",
             variables={"language": "Python", "code": "def foo(): pass"},
         )
-        # result["prompt_template_name"]    → "code-reviewer"
-        # result["prompt_template_version"] → 2
     """
 
     def __init__(
@@ -52,7 +81,7 @@ class ObservedLLM:
     ) -> None:
         self.model = model or settings.default_model
         self.max_tokens = max_tokens or settings.max_tokens
-        self._client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        self.provider = _detect_provider(self.model)
         self._tracer = TracingService.get_tracer()
 
     # ------------------------------------------------------------------ #
@@ -82,8 +111,8 @@ class ObservedLLM:
             feedback_score:   Pre-assigned quality label (0.0 – 1.0).
 
         Returns:
-            Dict with: response, model, latency_ms, prompt_tokens, completion_tokens,
-            total_tokens, estimated_cost, trace_id, error,
+            Dict with: response, model, provider, latency_ms, prompt_tokens,
+            completion_tokens, total_tokens, estimated_cost, trace_id, error,
             prompt_template_name, prompt_template_version.
         """
         if not prompt and not template_name:
@@ -122,6 +151,7 @@ class ObservedLLM:
 
         span_attrs: Dict[str, Any] = {
             "llm.model": self.model,
+            "llm.provider": self.provider,
             "llm.prompt_length": len(prompt),
             "llm.max_tokens": self.max_tokens,
             "llm.trace_id": trace_id,
@@ -131,24 +161,20 @@ class ObservedLLM:
 
         with self._tracer.start_as_current_span("llm.generate", attributes=span_attrs) as span:
             try:
-                messages = [{"role": "user", "content": prompt}]
-                call_kwargs: Dict[str, Any] = {
-                    "model": self.model,
-                    "max_tokens": self.max_tokens,
-                    "messages": messages,
-                }
-                if system:
-                    call_kwargs["system"] = system
-
-                message = await self._client.messages.create(**call_kwargs)
-
-                response_text = message.content[0].text
-                prompt_tokens = message.usage.input_tokens
-                completion_tokens = message.usage.output_tokens
+                response_text, prompt_tokens, completion_tokens = await self._call_provider(
+                    prompt=prompt, system=system
+                )
 
                 span.set_attribute("llm.prompt_tokens", prompt_tokens)
                 span.set_attribute("llm.completion_tokens", completion_tokens)
-                span.set_attribute("llm.response_length", len(response_text))
+                span.set_attribute("llm.response_length", len(response_text or ""))
+
+                # ---- auto-judge (skipped when explicit feedback_score provided) #
+                if response_text and feedback_score is None:
+                    from llm_observability.services.judge_service import JudgeService
+                    judge_score, _ = await JudgeService.score(prompt, response_text)
+                    if judge_score is not None:
+                        feedback_score = judge_score
 
             except Exception as exc:
                 error_text = str(exc)
@@ -173,6 +199,7 @@ class ObservedLLM:
                         prompt=prompt,
                         response=response_text,
                         model_name=self.model,
+                        provider=self.provider,
                         latency_ms=latency_ms if error_text is None else None,
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
@@ -190,11 +217,12 @@ class ObservedLLM:
                         ),
                     )
 
-                self._check_alerts(latency_ms=latency_ms, cost=estimated_cost)
+                await self._check_alerts(latency_ms=latency_ms, cost=estimated_cost)
 
         return {
             "response": response_text,
             "model": self.model,
+            "provider": self.provider,
             "latency_ms": latency_ms,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -207,16 +235,101 @@ class ObservedLLM:
         }
 
     # ------------------------------------------------------------------ #
+    # Provider routing
+    # ------------------------------------------------------------------ #
+
+    async def _call_provider(
+        self, prompt: str, system: Optional[str]
+    ) -> Tuple[str, int, int]:
+        """Dispatch to the appropriate SDK and return (response_text, prompt_tokens, completion_tokens)."""
+        if self.provider == "openai":
+            return await self._call_openai(prompt, system)
+        if self.provider == "google":
+            return await self._call_google(prompt, system)
+        return await self._call_anthropic(prompt, system)
+
+    async def _call_anthropic(
+        self, prompt: str, system: Optional[str]
+    ) -> Tuple[str, int, int]:
+        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        call_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system:
+            call_kwargs["system"] = system
+
+        message = await client.messages.create(**call_kwargs)
+        return (
+            message.content[0].text,
+            message.usage.input_tokens,
+            message.usage.output_tokens,
+        )
+
+    async def _call_openai(
+        self, prompt: str, system: Optional[str]
+    ) -> Tuple[str, int, int]:
+        try:
+            from openai import AsyncOpenAI
+        except ImportError:
+            raise RuntimeError(
+                "openai package is required for OpenAI models. Run: pip install openai"
+            )
+
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        resp = await client.chat.completions.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            messages=messages,
+        )
+        return (
+            resp.choices[0].message.content or "",
+            resp.usage.prompt_tokens,
+            resp.usage.completion_tokens,
+        )
+
+    async def _call_google(
+        self, prompt: str, system: Optional[str]
+    ) -> Tuple[str, int, int]:
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError:
+            raise RuntimeError(
+                "google-genai package is required for Gemini models. "
+                "Run: pip install google-genai"
+            )
+
+        client = genai.Client()  # reads GOOGLE_API_KEY from env
+        config = types.GenerateContentConfig(
+            max_output_tokens=self.max_tokens,
+            system_instruction=system,
+        )
+        resp = await client.aio.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=config,
+        )
+        usage = resp.usage_metadata
+        return (
+            resp.text or "",
+            usage.prompt_token_count or 0,
+            usage.candidates_token_count or 0,
+        )
+
+    # ------------------------------------------------------------------ #
     # Private helpers
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def _render_template(content: str, variables: Dict[str, str]) -> str:
-        """Substitute {placeholders} in a template with provided values.
-
-        Raises:
-            ValueError: If a required placeholder is missing from variables.
-        """
+        """Substitute {placeholders} in a template with provided values."""
         try:
             return content.format_map(variables)
         except KeyError as exc:
@@ -224,19 +337,48 @@ class ObservedLLM:
                 f"Template variable {exc} was not supplied in 'variables'"
             ) from exc
 
-    def _check_alerts(self, *, latency_ms: float, cost: float) -> None:
-        """Log WARNING when observability thresholds are breached."""
-        if latency_ms > settings.latency_alert_threshold_ms:
-            logger.warning(
-                "HIGH LATENCY ALERT — %.0fms exceeds threshold %.0fms [model=%s]",
-                latency_ms,
-                settings.latency_alert_threshold_ms,
-                self.model,
+    async def _check_alerts(self, *, latency_ms: float, cost: float) -> None:
+        """Fire webhook alerts (with per-type cooldown) when thresholds are breached.
+
+        Per-model overrides (MODEL_ALERT_THRESHOLDS_JSON) take priority over
+        the global LATENCY_ALERT_THRESHOLD_MS / COST_ALERT_THRESHOLD_USD values.
+        """
+        from llm_observability.services.alerting_service import AlertingService
+
+        _overrides = settings.model_alert_thresholds.get(self.model, {})
+        lat_threshold  = _overrides.get("latency_ms", settings.latency_alert_threshold_ms)
+        cost_threshold = _overrides.get("cost_usd",   settings.cost_alert_threshold_usd)
+
+        if latency_ms > lat_threshold:
+            await AlertingService.send_alert(
+                alert_type=f"high_latency_{self.model}",
+                title="High Latency Alert",
+                message=(
+                    f"Request took {latency_ms:,.0f}ms — "
+                    f"threshold is {lat_threshold:,.0f}ms"
+                ),
+                details={
+                    "Model": self.model,
+                    "Provider": self.provider,
+                    "Latency": f"{latency_ms:,.0f} ms",
+                    "Threshold": f"{lat_threshold:,.0f} ms",
+                },
+                color="danger",
             )
-        if cost > settings.cost_alert_threshold_usd:
-            logger.warning(
-                "HIGH COST ALERT — $%.6f exceeds threshold $%.2f [model=%s]",
-                cost,
-                settings.cost_alert_threshold_usd,
-                self.model,
+
+        if cost > cost_threshold:
+            await AlertingService.send_alert(
+                alert_type=f"high_cost_{self.model}",
+                title="High Cost Alert",
+                message=(
+                    f"Request cost ${cost:.6f} — "
+                    f"threshold is ${cost_threshold:.2f}"
+                ),
+                details={
+                    "Model": self.model,
+                    "Provider": self.provider,
+                    "Cost": f"${cost:.6f}",
+                    "Threshold": f"${cost_threshold:.2f}",
+                },
+                color="warning",
             )

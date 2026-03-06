@@ -7,6 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from llm_observability.api.schemas import (
+    ABTestRequest,
+    ABTestResponse,
+    ABTestResult,
     FeedbackRequest,
     GenerateRequest,
     GenerateResponse,
@@ -236,6 +239,60 @@ async def compare_prompt_versions(
             detail=f"No request data found for template '{name}' in the last {hours}h",
         )
     return [VersionComparisonRow(**row) for row in data]
+
+
+@router.post(
+    "/prompts/{name}/ab-generate",
+    response_model=ABTestResponse,
+    summary="Run an A/B test across two prompt versions",
+    description=(
+        "Sends the same prompt to two different versions of a template simultaneously "
+        "and returns both results for direct comparison. Both calls are fully observed "
+        "(latency, cost, tokens, and judge score if enabled)."
+    ),
+)
+async def ab_generate(
+    name: str,
+    body: ABTestRequest,
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> ABTestResponse:
+    import asyncio
+
+    async def _run(version: int) -> ABTestResult:
+        llm = ObservedLLM()
+        try:
+            result = await llm.generate(
+                template_name=name,
+                template_version=version,
+                variables=body.variables,
+                system=body.system,
+            )
+            return ABTestResult(
+                version=version,
+                response=result["response"],
+                latency_ms=result["latency_ms"],
+                prompt_tokens=result["prompt_tokens"],
+                completion_tokens=result["completion_tokens"],
+                estimated_cost=result["estimated_cost"],
+                feedback_score=None,
+                error=result["error"],
+                trace_id=result["trace_id"],
+            )
+        except Exception as exc:
+            return ABTestResult(
+                version=version,
+                response=None,
+                latency_ms=0.0,
+                prompt_tokens=0,
+                completion_tokens=0,
+                estimated_cost=0.0,
+                feedback_score=None,
+                error=str(exc),
+                trace_id="",
+            )
+
+    result_a, result_b = await asyncio.gather(_run(body.version_a), _run(body.version_b))
+    return ABTestResponse(template_name=name, result_a=result_a, result_b=result_b)
 
 
 @router.delete(

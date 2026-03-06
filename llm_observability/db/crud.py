@@ -30,6 +30,7 @@ async def create_request(
     trace_id: Optional[str] = None,
     feedback_score: Optional[float] = None,
     timestamp: Optional[datetime] = None,
+    provider: Optional[str] = None,
     # Prompt version control (all optional)
     prompt_template_id: Optional[int] = None,
     prompt_template_name: Optional[str] = None,
@@ -51,6 +52,7 @@ async def create_request(
         trace_id=trace_id,
         feedback_score=feedback_score,
         response_length=len(response) if response else 0,
+        provider=provider,
         prompt_template_id=prompt_template_id,
         prompt_template_name=prompt_template_name,
         prompt_template_version=prompt_template_version,

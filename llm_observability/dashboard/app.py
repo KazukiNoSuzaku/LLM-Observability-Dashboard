@@ -6,11 +6,13 @@ Run:
     streamlit run llm_observability/dashboard/app.py
 """
 
+import io
 import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -574,8 +576,17 @@ def load_data(hours: int, model_filter: str) -> pd.DataFrame:
     since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
     mc = "AND model_name = ?" if model_filter != "All" else ""
     params: list = [since] + ([model_filter] if model_filter != "All" else [])
+    conn = sqlite3.connect(DB_PATH)
+    # Ensure provider column exists (incremental migration for dashboard-only users)
+    try:
+        conn.execute("ALTER TABLE llm_requests ADD COLUMN provider TEXT")
+        conn.commit()
+    except Exception:
+        pass
     q = f"""
-        SELECT id, timestamp, model_name, latency_ms,
+        SELECT id, timestamp, model_name,
+               COALESCE(provider, 'anthropic') AS provider,
+               latency_ms,
                prompt_tokens, completion_tokens, total_tokens,
                estimated_cost, is_error, feedback_score, response_length,
                SUBSTR(prompt,   1, 120) AS prompt_preview,
@@ -584,7 +595,6 @@ def load_data(hours: int, model_filter: str) -> pd.DataFrame:
         WHERE timestamp >= ? {mc}
         ORDER BY timestamp DESC
     """
-    conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(q, conn, params=params)
     conn.close()
     if not df.empty:
@@ -719,6 +729,29 @@ with st.sidebar:
     latency_threshold = st.slider("Latency (ms)", 500, 30_000, 5_000, 500)
     cost_threshold    = st.slider("Cost (USD)",   0.01, 1.00,  0.10,  0.01)
 
+    with st.expander("Per-Model Overrides"):
+        st.markdown(
+            "<div style='font-size:0.62rem;color:#475569;margin-bottom:8px'>"
+            "Override global thresholds for a specific model.</div>",
+            unsafe_allow_html=True,
+        )
+        if "model_thresholds" not in st.session_state:
+            st.session_state.model_thresholds = {}
+        _avail = [m for m in get_available_models() if m != "All"]
+        if _avail:
+            _om = st.selectbox("Model", _avail, key="om_sel")
+            _prev = st.session_state.model_thresholds.get(_om, {})
+            _om_lat  = st.slider("Latency (ms)", 500, 30_000,
+                                 int(_prev.get("latency", 5_000)), 500, key="om_lat")
+            _om_cost = st.slider("Cost (USD)", 0.01, 1.00,
+                                 float(_prev.get("cost", 0.10)), 0.01, key="om_cost")
+            if st.button("Save override", key="save_om"):
+                st.session_state.model_thresholds[_om] = {
+                    "latency": _om_lat, "cost": _om_cost,
+                }
+        else:
+            st.caption("No models in database yet.")
+
     st.markdown("<hr/>", unsafe_allow_html=True)
     auto_refresh = st.checkbox("Auto-refresh (10 s)", value=False)
     if st.button("Refresh now"):
@@ -766,6 +799,14 @@ if df.empty:
     st.warning("No data. Run `make seed` to populate sample records.")
     st.code("make seed\nstreamlit run llm_observability/dashboard/app.py", language="bash")
     st.stop()
+
+# ---------------------------------------------------------------------------
+# Effective thresholds — model-specific overrides take priority
+# ---------------------------------------------------------------------------
+_mt = st.session_state.get("model_thresholds", {})
+_sel_model = model_filter if model_filter != "All" else None
+eff_lat_threshold  = _mt.get(_sel_model or "__none__", {}).get("latency",  latency_threshold)
+eff_cost_threshold = _mt.get(_sel_model or "__none__", {}).get("cost", cost_threshold)
 
 # ---------------------------------------------------------------------------
 # Derived metrics
@@ -821,7 +862,7 @@ with c1:
         unsafe_allow_html=True,
     )
 with c2:
-    hi = avg_lat > latency_threshold
+    hi = avg_lat > eff_lat_threshold
     st.markdown(
         _kpi("Avg Latency", f"{avg_lat:,.0f}",
              "HIGH" if hi else "Normal", "berr" if hi else "bok",
@@ -836,7 +877,7 @@ with c3:
         unsafe_allow_html=True,
     )
 with c4:
-    hi = total_cost > cost_threshold
+    hi = total_cost > eff_cost_threshold
     st.markdown(
         _kpi("Total Cost", f"${total_cost:.4f}",
              "HIGH" if hi else "Normal", "berr" if hi else "bok",
@@ -861,7 +902,7 @@ st.markdown(_sec("Time Series"), unsafe_allow_html=True)
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown(_cc("Latency Over Time", "1-min"), unsafe_allow_html=True)
+    st.markdown(_cc("Latency Over Time", "1-min · anomalies flagged"), unsafe_allow_html=True)
     df_lat = (
         ok.set_index("timestamp")
         .resample("1min")["latency_ms"]
@@ -869,6 +910,12 @@ with col1:
         .reset_index().dropna()
     )
     if not df_lat.empty:
+        # Z-score anomaly detection on per-bucket avg latency
+        _lat_mean = df_lat["avg"].mean()
+        _lat_std  = df_lat["avg"].std() or 1.0
+        df_lat["z"] = (df_lat["avg"] - _lat_mean) / _lat_std
+        _anom_lat = df_lat[df_lat["z"].abs() > 2.5]
+
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=df_lat["timestamp"], y=df_lat["avg"],
@@ -882,9 +929,16 @@ with col1:
             name="p95",
             line=dict(color="#8b5cf6", width=1.5, dash="dot", shape="spline"),
         ))
+        if not _anom_lat.empty:
+            fig.add_trace(go.Scatter(
+                x=_anom_lat["timestamp"], y=_anom_lat["avg"],
+                mode="markers", name="Anomaly",
+                marker=dict(color="#f43f5e", size=11, symbol="diamond",
+                            line=dict(color="#f1f5f9", width=1.5)),
+            ))
         fig.add_hline(
-            y=latency_threshold, line_dash="dash", line_color="#f59e0b",
-            annotation_text=f"Alert  {latency_threshold}ms",
+            y=eff_lat_threshold, line_dash="dash", line_color="#f59e0b",
+            annotation_text=f"Alert  {eff_lat_threshold:,.0f}ms",
             annotation_font_color="#f59e0b", annotation_font_size=10,
         )
         fig.update_layout(**_layout(CHART_H, yaxis_title="ms"))
@@ -894,7 +948,7 @@ with col1:
     st.markdown("</div>", unsafe_allow_html=True)
 
 with col2:
-    st.markdown(_cc("Cost Over Time", "1-min"), unsafe_allow_html=True)
+    st.markdown(_cc("Cost Over Time", "1-min · forecast"), unsafe_allow_html=True)
     df_cost = (
         df.set_index("timestamp")
         .resample("1min")["estimated_cost"]
@@ -906,8 +960,7 @@ with col2:
         fig.add_trace(go.Bar(
             x=df_cost["timestamp"], y=df_cost["estimated_cost"],
             name="Per min",
-            marker=dict(color="#06b6d4", opacity=0.65,
-                        line=dict(width=0)),
+            marker=dict(color="#06b6d4", opacity=0.65, line=dict(width=0)),
         ))
         fig.add_trace(go.Scatter(
             x=df_cost["timestamp"], y=df_cost["cum"],
@@ -915,15 +968,32 @@ with col2:
             line=dict(color="#f59e0b", width=2, shape="spline"),
             yaxis="y2",
         ))
+        # Cost forecast — linear regression on cumulative cost
+        if len(df_cost) >= 4:
+            _xs = np.arange(len(df_cost), dtype=float)
+            _ys = df_cost["cum"].values.astype(float)
+            _coeffs = np.polyfit(_xs, _ys, 1)
+            _n_fwd = max(6, len(df_cost) // 4)
+            _freq = df_cost["timestamp"].diff().median()
+            _last_ts = df_cost["timestamp"].iloc[-1]
+            _fx = np.arange(len(df_cost) - 1, len(df_cost) + _n_fwd)
+            _fy = np.polyval(_coeffs, _fx)
+            _fts = [_last_ts + _freq * i for i in range(len(_fx))]
+            fig.add_trace(go.Scatter(
+                x=_fts, y=_fy,
+                name="Forecast",
+                line=dict(color="#f43f5e", width=1.5, dash="dot"),
+                yaxis="y2",
+            ))
         fig.add_hline(
-            y=cost_threshold, line_dash="dash", line_color="#f43f5e",
-            annotation_text=f"Alert  ${cost_threshold:.2f}",
+            y=eff_cost_threshold, line_dash="dash", line_color="#f43f5e",
+            annotation_text=f"Alert  ${eff_cost_threshold:.2f}",
             annotation_font_color="#f43f5e", annotation_font_size=10,
         )
         layout = _layout(
             CHART_H, yaxis_title="USD",
             yaxis2=dict(
-                title="Cumulative", overlaying="y", side="right",
+                title="Cumulative / Forecast", overlaying="y", side="right",
                 showgrid=False, tickfont=dict(size=10, color="#475569"),
             ),
             barmode="overlay",
@@ -986,7 +1056,7 @@ with col2:
 # Distribution & Model breakdown
 # ---------------------------------------------------------------------------
 st.markdown(_sec("Distribution & Breakdown"), unsafe_allow_html=True)
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 
 with col1:
     st.markdown(_cc("Latency Distribution", "histogram"), unsafe_allow_html=True)
@@ -1037,6 +1107,42 @@ with col2:
         st.info("No model data.")
     st.markdown("</div>", unsafe_allow_html=True)
 
+with col3:
+    st.markdown(_cc("Requests by Provider", "donut"), unsafe_allow_html=True)
+    if "provider" in df.columns:
+        pc = df.groupby("provider").agg(requests=("id", "count")).reset_index()
+        if not pc.empty:
+            PROVIDER_COLORS = {
+                "anthropic": "#f59e0b",
+                "openai":    "#10b981",
+                "google":    "#06b6d4",
+            }
+            colors = [PROVIDER_COLORS.get(p, "#8b5cf6") for p in pc["provider"]]
+            fig = px.pie(
+                pc, values="requests", names="provider", hole=0.58,
+                color_discrete_sequence=colors,
+            )
+            fig.update_traces(
+                textposition="inside", textinfo="percent",
+                textfont=dict(size=11, color="#f1f5f9"),
+                marker=dict(line=dict(color="rgba(0,0,0,0)", width=0)),
+                pull=[0.03] * len(pc),
+            )
+            fig.update_layout(**_layout(
+                CHART_H,
+                legend=dict(
+                    orientation="v", x=0.78, y=0.5,
+                    font=dict(size=10, color="#64748b"),
+                    bgcolor="rgba(0,0,0,0)",
+                ),
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No provider data.")
+    else:
+        st.info("No provider data.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
 # ---------------------------------------------------------------------------
 # Secondary KPIs
 # ---------------------------------------------------------------------------
@@ -1063,8 +1169,9 @@ with c3:
     )
 with c4:
     fb_str = f"{avg_fb:.2f}" if not pd.isna(avg_fb) else "—"
+    judge_sub = "auto-judged" if not pd.isna(avg_fb) else "0 – 1.0 scale"
     st.markdown(
-        _kpi("Avg Feedback", fb_str, "quality", "bok", "0 – 1.0 scale", "ce k4", 4),
+        _kpi("Avg Quality Score", fb_str, "judge", "bok", judge_sub, "ce k4", 4),
         unsafe_allow_html=True,
     )
 
@@ -1108,6 +1215,127 @@ st.dataframe(
         "Error":    st.column_config.CheckboxColumn(),
     },
 )
+
+# CSV / full export
+_exp1, _exp2, _exp3 = st.columns([1, 1, 4])
+with _exp1:
+    _csv_bytes = disp.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download filtered CSV",
+        data=_csv_bytes,
+        file_name=f"llm_requests_filtered_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+        key="dl_filtered",
+    )
+with _exp2:
+    # Full export — all columns, all rows in current time window
+    _full_export = df.drop(columns=["prompt_preview", "response_preview"], errors="ignore").copy()
+    _full_export["timestamp"] = _full_export["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    _full_csv = _full_export.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download full CSV",
+        data=_full_csv,
+        file_name=f"llm_requests_full_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+        key="dl_full",
+    )
+
+# ===========================================================================
+# Anomaly Detection
+# ===========================================================================
+st.markdown(_sec("Anomaly Detection"), unsafe_allow_html=True)
+
+_Z_THRESH = 2.5  # flag anything beyond 2.5 standard deviations
+
+if not ok.empty and len(ok) >= 5:
+    _lat_mu, _lat_sig = ok["latency_ms"].mean(), ok["latency_ms"].std() or 1.0
+    _cost_mu, _cost_sig = df["estimated_cost"].mean(), df["estimated_cost"].std() or 1.0
+
+    _anom = ok.copy()
+    _anom["lat_z"]  = (_anom["latency_ms"] - _lat_mu)  / _lat_sig
+    _anom_cost_df   = df.copy()
+    _anom_cost_df["cost_z"] = (_anom_cost_df["estimated_cost"] - _cost_mu) / _cost_sig
+
+    _lat_outliers  = _anom[_anom["lat_z"].abs()  > _Z_THRESH]
+    _cost_outliers = _anom_cost_df[_anom_cost_df["cost_z"].abs() > _Z_THRESH]
+
+    # Combine and deduplicate by id
+    _all_anom = pd.concat([
+        _lat_outliers[["id","timestamp","model_name","latency_ms","estimated_cost","lat_z"]]
+            .rename(columns={"lat_z": "z_score"})
+            .assign(signal="Latency"),
+        _cost_outliers[["id","timestamp","model_name","latency_ms","estimated_cost","cost_z"]]
+            .rename(columns={"cost_z": "z_score"})
+            .assign(signal="Cost"),
+    ]).drop_duplicates(subset="id").sort_values("z_score", ascending=False, key=abs)
+
+    n_anom = len(_all_anom)
+
+    _ac1, _ac2, _ac3, _ac4 = st.columns(4)
+    with _ac1:
+        color = "#f43f5e" if n_anom > 0 else "#10b981"
+        st.markdown(
+            f"""<div class="kpi-card {'cr' if n_anom > 0 else 'ce'} k1">
+              <div><div class="kpi-label">Anomalies Detected</div>
+              <div class="kpi-value" style="color:{color} !important">{n_anom}</div></div>
+              <div class="kpi-footer">
+                <span class="kpi-badge {'berr' if n_anom > 0 else 'bok'}">
+                  {'Active' if n_anom > 0 else 'Clean'}</span>
+              </div></div>""",
+            unsafe_allow_html=True,
+        )
+    with _ac2:
+        n_lat  = int(_anom["lat_z"].abs().gt(_Z_THRESH).sum())
+        st.markdown(
+            f"""<div class="kpi-card ca k2">
+              <div><div class="kpi-label">Latency Spikes</div>
+              <div class="kpi-value">{n_lat}</div></div>
+              <div class="kpi-footer">
+                <span class="kpi-badge bwarn">|z| &gt; {_Z_THRESH}</span>
+              </div></div>""",
+            unsafe_allow_html=True,
+        )
+    with _ac3:
+        n_cost = int(_anom_cost_df["cost_z"].abs().gt(_Z_THRESH).sum())
+        st.markdown(
+            f"""<div class="kpi-card cv k3">
+              <div><div class="kpi-label">Cost Spikes</div>
+              <div class="kpi-value">{n_cost}</div></div>
+              <div class="kpi-footer">
+                <span class="kpi-badge bvio">|z| &gt; {_Z_THRESH}</span>
+              </div></div>""",
+            unsafe_allow_html=True,
+        )
+    with _ac4:
+        _worst_z = _all_anom["z_score"].abs().max() if not _all_anom.empty else 0.0
+        st.markdown(
+            f"""<div class="kpi-card {'cr' if _worst_z > 3.5 else 'ca'} k4">
+              <div><div class="kpi-label">Worst Z-Score</div>
+              <div class="kpi-value">{_worst_z:.1f}</div></div>
+              <div class="kpi-footer">
+                <span class="kpi-badge {'berr' if _worst_z > 3.5 else 'bwarn'}">σ</span>
+              </div></div>""",
+            unsafe_allow_html=True,
+        )
+
+    if not _all_anom.empty:
+        st.markdown(
+            "<div style='font-size:0.68rem;font-weight:700;color:#64748b;"
+            "letter-spacing:0.05em;margin:18px 0 8px'>Flagged Requests</div>",
+            unsafe_allow_html=True,
+        )
+        _anom_disp = _all_anom.head(20).copy()
+        _anom_disp["timestamp"]      = _anom_disp["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        _anom_disp["latency_ms"]     = _anom_disp["latency_ms"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
+        _anom_disp["estimated_cost"] = _anom_disp["estimated_cost"].apply(lambda x: f"${x:.6f}" if pd.notna(x) else "—")
+        _anom_disp["z_score"]        = _anom_disp["z_score"].apply(lambda x: f"{x:+.2f}σ")
+        _anom_disp.columns = ["ID", "Timestamp", "Model", "Latency (ms)", "Cost (USD)", "Z-Score", "Signal"]
+        st.dataframe(_anom_disp[["Timestamp","Model","Signal","Latency (ms)","Cost (USD)","Z-Score"]],
+                     use_container_width=True, hide_index=True)
+    else:
+        st.success("No anomalies detected in the current window.")
+else:
+    st.info("Need at least 5 successful requests to compute anomaly scores.")
 
 # ===========================================================================
 # Prompt Version Control
@@ -1251,6 +1479,198 @@ else:
                     st.caption("User template")
                     st.code(row["content"], language="text")
                     st.caption(f"Created: {row['created_at']}")
+
+# ===========================================================================
+# A/B Experiment Head-to-Head
+# ===========================================================================
+st.markdown(_sec("A/B Experiment"), unsafe_allow_html=True)
+st.markdown(
+    "<div style='font-size:0.74rem;color:#475569;margin-bottom:16px'>"
+    "Select two versions of the same template for a direct head-to-head performance comparison.</div>",
+    unsafe_allow_html=True,
+)
+
+ab_template_names = get_template_names()
+
+if not ab_template_names:
+    st.info("No prompt templates found. Run `python scripts/seed_data.py` to generate samples.")
+else:
+    ab1, ab2, ab3 = st.columns([3, 1, 1])
+    with ab1:
+        ab_tpl = st.selectbox("Template", ab_template_names, key="ab_tpl")
+    with ab2:
+        ab_hours = st.selectbox(
+            "Window", [1, 6, 24, 48, 168], index=2,
+            format_func=lambda x: {1:"1h",6:"6h",24:"24h",48:"48h",168:"7d"}[x],
+            key="ab_hours",
+        )
+
+    ab_df = load_version_metrics(ab_tpl, ab_hours)
+
+    if ab_df.empty or len(ab_df) < 2:
+        st.info(
+            f"Need at least 2 versions of **{ab_tpl}** with data in the last {ab_hours}h. "
+            "Run more requests or extend the time window."
+        )
+    else:
+        versions = sorted(ab_df["version"].dropna().astype(int).tolist())
+        with ab3:
+            st.markdown(
+                "<div style='font-size:0.62rem;font-weight:700;letter-spacing:0.08em;"
+                "text-transform:uppercase;color:#64748b;margin-bottom:6px'>Versions</div>",
+                unsafe_allow_html=True,
+            )
+
+        ab_col1, ab_col2 = st.columns(2)
+        with ab_col1:
+            ver_a = st.selectbox("Version A", versions, index=0, key="ver_a")
+        with ab_col2:
+            ver_b = st.selectbox("Version B", versions, index=min(1, len(versions)-1), key="ver_b")
+
+        if ver_a == ver_b:
+            st.warning("Select two different versions to compare.")
+        else:
+            row_a = ab_df[ab_df["version"] == ver_a].iloc[0]
+            row_b = ab_df[ab_df["version"] == ver_b].iloc[0]
+
+            # Helper: determine winner cell style
+            def _winner(a_val, b_val, lower_is_better=True):
+                if pd.isna(a_val) or pd.isna(b_val):
+                    return "—", "—"
+                if lower_is_better:
+                    wa = '<span style="color:#10b981;font-weight:700">WIN</span>' if a_val <= b_val else ""
+                    wb = '<span style="color:#10b981;font-weight:700">WIN</span>' if b_val < a_val else ""
+                else:
+                    wa = '<span style="color:#10b981;font-weight:700">WIN</span>' if a_val >= b_val else ""
+                    wb = '<span style="color:#10b981;font-weight:700">WIN</span>' if b_val > a_val else ""
+                return wa, wb
+
+            w_lat_a,  w_lat_b  = _winner(row_a["avg_latency_ms"], row_b["avg_latency_ms"], lower_is_better=True)
+            w_cost_a, w_cost_b = _winner(row_a["avg_cost"],        row_b["avg_cost"],        lower_is_better=True)
+            w_fb_a,   w_fb_b   = _winner(row_a["avg_feedback"],    row_b["avg_feedback"],    lower_is_better=False)
+            w_err_a,  w_err_b  = _winner(
+                row_a["errors"] / max(row_a["request_count"], 1),
+                row_b["errors"] / max(row_b["request_count"], 1),
+                lower_is_better=True,
+            )
+
+            def _fmt_val(v, fmt):
+                return fmt.format(v) if pd.notna(v) else "—"
+
+            st.markdown(
+                f"""
+                <div style="overflow-x:auto;margin-top:12px">
+                <table style="width:100%;border-collapse:collapse;font-size:0.78rem">
+                  <thead>
+                    <tr style="border-bottom:1px solid rgba(255,255,255,0.07)">
+                      <th style="text-align:left;padding:10px 14px;color:#475569;font-weight:700;
+                                 font-size:0.62rem;letter-spacing:0.08em;text-transform:uppercase">Metric</th>
+                      <th style="text-align:center;padding:10px 14px;color:#8b5cf6;font-weight:700">
+                        v{ver_a} (A)</th>
+                      <th style="text-align:center;padding:10px 14px;color:#06b6d4;font-weight:700">
+                        v{ver_b} (B)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr style="border-bottom:1px solid rgba(255,255,255,0.04)">
+                      <td style="padding:9px 14px;color:#64748b">Requests</td>
+                      <td style="text-align:center;padding:9px 14px;color:#f1f5f9">{int(row_a['request_count'])}</td>
+                      <td style="text-align:center;padding:9px 14px;color:#f1f5f9">{int(row_b['request_count'])}</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid rgba(255,255,255,0.04)">
+                      <td style="padding:9px 14px;color:#64748b">Avg Latency</td>
+                      <td style="text-align:center;padding:9px 14px;color:#f1f5f9">
+                        {_fmt_val(row_a['avg_latency_ms'], '{:.0f} ms')} {w_lat_a}</td>
+                      <td style="text-align:center;padding:9px 14px;color:#f1f5f9">
+                        {_fmt_val(row_b['avg_latency_ms'], '{:.0f} ms')} {w_lat_b}</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid rgba(255,255,255,0.04)">
+                      <td style="padding:9px 14px;color:#64748b">Avg Cost / Req</td>
+                      <td style="text-align:center;padding:9px 14px;color:#f1f5f9">
+                        {_fmt_val(row_a['avg_cost'], '${:.8f}')} {w_cost_a}</td>
+                      <td style="text-align:center;padding:9px 14px;color:#f1f5f9">
+                        {_fmt_val(row_b['avg_cost'], '${:.8f}')} {w_cost_b}</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid rgba(255,255,255,0.04)">
+                      <td style="padding:9px 14px;color:#64748b">Avg Quality Score</td>
+                      <td style="text-align:center;padding:9px 14px;color:#f1f5f9">
+                        {_fmt_val(row_a['avg_feedback'], '{:.3f}')} {w_fb_a}</td>
+                      <td style="text-align:center;padding:9px 14px;color:#f1f5f9">
+                        {_fmt_val(row_b['avg_feedback'], '{:.3f}')} {w_fb_b}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:9px 14px;color:#64748b">Error Rate</td>
+                      <td style="text-align:center;padding:9px 14px;color:#f1f5f9">
+                        {int(row_a['errors'])} err / {int(row_a['request_count'])} req {w_err_a}</td>
+                      <td style="text-align:center;padding:9px 14px;color:#f1f5f9">
+                        {int(row_b['errors'])} err / {int(row_b['request_count'])} req {w_err_b}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # Grouped bar chart
+            BCOLS = ["#8b5cf6", "#06b6d4"]
+            ab_chart_df = pd.DataFrame({
+                "Metric": ["Avg Latency (ms)", "Avg Cost ($×10⁶)", "Quality Score (×10)", "Error Rate (%)"],
+                f"v{ver_a}": [
+                    row_a["avg_latency_ms"] or 0,
+                    (row_a["avg_cost"] or 0) * 1_000_000,
+                    (row_a["avg_feedback"] or 0) * 10,
+                    (row_a["errors"] / max(row_a["request_count"], 1)) * 100,
+                ],
+                f"v{ver_b}": [
+                    row_b["avg_latency_ms"] or 0,
+                    (row_b["avg_cost"] or 0) * 1_000_000,
+                    (row_b["avg_feedback"] or 0) * 10,
+                    (row_b["errors"] / max(row_b["request_count"], 1)) * 100,
+                ],
+            })
+            st.markdown(_cc("Head-to-Head Comparison", "normalised"), unsafe_allow_html=True)
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                name=f"v{ver_a}", x=ab_chart_df["Metric"], y=ab_chart_df[f"v{ver_a}"],
+                marker_color=BCOLS[0], marker_opacity=0.85, marker_line_width=0,
+            ))
+            fig.add_trace(go.Bar(
+                name=f"v{ver_b}", x=ab_chart_df["Metric"], y=ab_chart_df[f"v{ver_b}"],
+                marker_color=BCOLS[1], marker_opacity=0.85, marker_line_width=0,
+            ))
+            fig.update_layout(**_layout(
+                260, barmode="group",
+                xaxis_title=None, yaxis_title="Value (normalised)",
+                legend=dict(orientation="h", y=1.15, x=0, font=dict(size=10, color="#64748b")),
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            # Summary verdict
+            wins_a = sum([
+                1 if (pd.notna(row_a["avg_latency_ms"]) and pd.notna(row_b["avg_latency_ms"]) and row_a["avg_latency_ms"] <= row_b["avg_latency_ms"]) else 0,
+                1 if (pd.notna(row_a["avg_cost"])        and pd.notna(row_b["avg_cost"])        and row_a["avg_cost"] <= row_b["avg_cost"]) else 0,
+                1 if (pd.notna(row_a["avg_feedback"])    and pd.notna(row_b["avg_feedback"])    and row_a["avg_feedback"] >= row_b["avg_feedback"]) else 0,
+            ])
+            wins_b = sum([
+                1 if (pd.notna(row_a["avg_latency_ms"]) and pd.notna(row_b["avg_latency_ms"]) and row_b["avg_latency_ms"] < row_a["avg_latency_ms"]) else 0,
+                1 if (pd.notna(row_a["avg_cost"])        and pd.notna(row_b["avg_cost"])        and row_b["avg_cost"] < row_a["avg_cost"]) else 0,
+                1 if (pd.notna(row_a["avg_feedback"])    and pd.notna(row_b["avg_feedback"])    and row_b["avg_feedback"] > row_a["avg_feedback"]) else 0,
+            ])
+            if wins_a > wins_b:
+                verdict = f'<span style="color:#10b981;font-weight:700">v{ver_a}</span> wins ({wins_a}/3 metrics)'
+            elif wins_b > wins_a:
+                verdict = f'<span style="color:#10b981;font-weight:700">v{ver_b}</span> wins ({wins_b}/3 metrics)'
+            else:
+                verdict = '<span style="color:#f59e0b;font-weight:700">Tie</span>'
+
+            st.markdown(
+                f"<div style='font-size:0.75rem;color:#64748b;margin-top:14px;text-align:center'>"
+                f"Verdict: {verdict} &nbsp;·&nbsp; "
+                f"<span style='color:#475569'>based on latency, cost, and quality score</span></div>",
+                unsafe_allow_html=True,
+            )
 
 # ---------------------------------------------------------------------------
 # Footer

@@ -20,9 +20,10 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------ #
-    # LLM provider
+    # LLM providers
     # ------------------------------------------------------------------ #
     anthropic_api_key: str = Field(default="", description="Anthropic API key")
+    openai_api_key: str = Field(default="", description="OpenAI API key")
 
     # ------------------------------------------------------------------ #
     # Database
@@ -69,6 +70,54 @@ class Settings(BaseSettings):
     cost_alert_threshold_usd: float = Field(
         default=0.10,
         description="Log WARNING when cumulative cost in any window exceeds this (USD)",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Webhook alerting
+    # ------------------------------------------------------------------ #
+    slack_webhook_url: str = Field(
+        default="",
+        description="Slack Incoming Webhook URL (leave empty to disable)",
+    )
+    discord_webhook_url: str = Field(
+        default="",
+        description="Discord Webhook URL (leave empty to disable)",
+    )
+    alert_cooldown_seconds: int = Field(
+        default=300,
+        description="Minimum seconds between repeated alerts of the same type",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Per-model alert threshold overrides
+    # ------------------------------------------------------------------ #
+    model_alert_thresholds_json: str = Field(
+        default="{}",
+        description=(
+            'JSON dict overriding global thresholds per model. '
+            'Example: \'{"gpt-4o": {"latency_ms": 3000, "cost_usd": 0.05}}\''
+        ),
+    )
+
+    @property
+    def model_alert_thresholds(self) -> dict:
+        """Parsed per-model threshold overrides."""
+        import json
+        try:
+            return json.loads(self.model_alert_thresholds_json)
+        except Exception:
+            return {}
+
+    # ------------------------------------------------------------------ #
+    # LLM-as-judge quality scoring
+    # ------------------------------------------------------------------ #
+    judge_enabled: bool = Field(
+        default=False,
+        description="Auto-score responses with a judge LLM after each generation",
+    )
+    judge_model: str = Field(
+        default="claude-haiku-4-5-20251001",
+        description="Model used for automated quality scoring (cheap fast model recommended)",
     )
 
 
