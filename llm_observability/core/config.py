@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     anthropic_api_key: str = Field(default="", description="Anthropic API key")
     openai_api_key: str = Field(default="", description="OpenAI API key")
+    mistral_api_key: str = Field(default="", description="Mistral AI API key")
 
     # ------------------------------------------------------------------ #
     # Database

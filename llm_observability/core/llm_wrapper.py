@@ -18,6 +18,8 @@ Supported providers
   anthropic — any ``claude-*`` model
   openai    — any ``gpt-*``, ``o1-*``, ``o3-*`` model
   google    — any ``gemini-*`` model (requires ``google-genai`` package)
+  mistral   — any ``mistral-*``, ``mixtral-*``, ``codestral-*``, ``pixtral-*`` model
+              (requires ``mistralai`` package)
 """
 
 import json
@@ -48,6 +50,8 @@ def _detect_provider(model_name: str) -> str:
         return "openai"
     if m.startswith("gemini-"):
         return "google"
+    if m.startswith(("mistral-", "mixtral-", "codestral-", "pixtral-")):
+        return "mistral"
     return "anthropic"
 
 
@@ -278,6 +282,8 @@ class ObservedLLM:
             return await self._call_openai(prompt, system)
         if self.provider == "google":
             return await self._call_google(prompt, system)
+        if self.provider == "mistral":
+            return await self._call_mistral(prompt, system)
         return await self._call_anthropic(prompt, system)
 
     async def _call_anthropic(
@@ -353,6 +359,44 @@ class ObservedLLM:
             resp.text or "",
             usage.prompt_token_count or 0,
             usage.candidates_token_count or 0,
+        )
+
+    async def _call_mistral(
+        self, prompt: str, system: Optional[str]
+    ) -> Tuple[str, int, int]:
+        """Call the Mistral AI API via the ``mistralai`` SDK.
+
+        Supports all models prefixed ``mistral-*``, ``mixtral-*``,
+        ``codestral-*``, and ``pixtral-*``.
+
+        Requires:
+            pip install mistralai
+            MISTRAL_API_KEY=<your key>
+        """
+        try:
+            from mistralai import Mistral  # type: ignore
+        except ImportError:
+            raise RuntimeError(
+                "mistralai package is required for Mistral models. "
+                "Run: pip install mistralai"
+            )
+
+        client = Mistral(api_key=settings.mistral_api_key)
+
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        resp = await client.chat.complete_async(
+            model=self.model,
+            messages=messages,
+            max_tokens=self.max_tokens,
+        )
+        return (
+            resp.choices[0].message.content or "",
+            resp.usage.prompt_tokens,
+            resp.usage.completion_tokens,
         )
 
     # ------------------------------------------------------------------ #

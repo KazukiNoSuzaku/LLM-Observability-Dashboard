@@ -40,6 +40,21 @@ MODEL_PRICING: Dict[str, Tuple[float, float]] = {
     "gemini-2.0-flash-lite": (0.075, 0.30),
     "gemini-1.5-pro": (1.25, 5.00),
     "gemini-1.5-flash": (0.075, 0.30),
+    # ------------------------------------------------------------------ #
+    # Mistral AI
+    # ------------------------------------------------------------------ #
+    "mistral-large-latest": (2.00, 6.00),
+    "mistral-large-2411": (2.00, 6.00),
+    "mistral-medium-latest": (0.40, 2.00),
+    "mistral-small-latest": (0.10, 0.30),
+    "mistral-small-2501": (0.10, 0.30),
+    "mistral-nemo": (0.15, 0.15),
+    "codestral-latest": (0.20, 0.60),
+    "codestral-2501": (0.20, 0.60),
+    "pixtral-large-latest": (2.00, 6.00),
+    "pixtral-12b-2409": (0.15, 0.15),
+    "mixtral-8x7b-instruct": (0.70, 0.70),
+    "mixtral-8x22b-instruct": (2.00, 6.00),
 }
 
 # Fallback pricing when the model is not in the table
