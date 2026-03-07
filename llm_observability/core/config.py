@@ -120,6 +120,33 @@ class Settings(BaseSettings):
         description="Model used for automated quality scoring (cheap fast model recommended)",
     )
 
+    # ------------------------------------------------------------------ #
+    # Guardrails
+    # ------------------------------------------------------------------ #
+    guardrails_enabled: bool = Field(
+        default=True,
+        description="Master on/off switch for input/output guardrails",
+    )
+    guardrails_block_on_pii: bool = Field(
+        default=False,
+        description="Block (reject) requests that contain PII — if False, PII is redacted",
+    )
+    guardrails_block_on_jailbreak: bool = Field(
+        default=True,
+        description="Block requests that match jailbreak/prompt-injection patterns",
+    )
+    guardrails_redact_output_pii: bool = Field(
+        default=True,
+        description="Replace PII tokens in LLM responses with [REDACTED:TYPE] placeholders",
+    )
+    guardrails_use_presidio: bool = Field(
+        default=True,
+        description=(
+            "Use Microsoft Presidio for PII detection when installed; "
+            "falls back to compiled regex if presidio-analyzer is not available"
+        ),
+    )
+
 
 # Module-level singleton — import from here everywhere
 settings = Settings()

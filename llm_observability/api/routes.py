@@ -13,6 +13,8 @@ from llm_observability.api.schemas import (
     FeedbackRequest,
     GenerateRequest,
     GenerateResponse,
+    GuardrailLogResponse,
+    GuardrailStatsResponse,
     LLMRequestResponse,
     MetricsSummaryResponse,
     PromptTemplateCreate,
@@ -293,6 +295,52 @@ async def ab_generate(
 
     result_a, result_b = await asyncio.gather(_run(body.version_a), _run(body.version_b))
     return ABTestResponse(template_name=name, result_a=result_a, result_b=result_b)
+
+
+# ============================================================================ #
+# Guardrails
+# ============================================================================ #
+
+
+@router.get(
+    "/guardrails/logs",
+    response_model=List[GuardrailLogResponse],
+    summary="Paginated guardrail violation log",
+    description=(
+        "Returns guardrail violation events (PII detections, jailbreak blocks, "
+        "output validation failures) newest first."
+    ),
+)
+async def get_guardrail_logs(
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=1000),
+    hours: int = Query(default=24, ge=1, le=720),
+    violation_type: Optional[str] = Query(default=None),
+    stage: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> List[GuardrailLogResponse]:
+    rows = await crud.get_guardrail_logs(
+        db,
+        skip=skip,
+        limit=limit,
+        hours=hours,
+        violation_type=violation_type,
+        stage=stage,
+    )
+    return [GuardrailLogResponse.model_validate(r) for r in rows]
+
+
+@router.get(
+    "/guardrails/stats",
+    response_model=GuardrailStatsResponse,
+    summary="Aggregate guardrail statistics",
+)
+async def get_guardrail_stats(
+    hours: int = Query(default=24, ge=1, le=720),
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> GuardrailStatsResponse:
+    stats = await crud.get_guardrail_stats(db, hours=hours)
+    return GuardrailStatsResponse(**stats)
 
 
 @router.delete(

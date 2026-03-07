@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import Integer, cast, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from llm_observability.db.models import LLMRequest, PromptTemplate
+from llm_observability.db.models import GuardrailLog, LLMRequest, PromptTemplate
 
 
 # ============================================================================ #
@@ -167,6 +167,120 @@ async def get_metrics_summary(
         "error_count": error_count,
         "error_rate_pct": round(error_rate, 2),
         "hours": hours,
+    }
+
+
+# ============================================================================ #
+# GuardrailLog — write and read operations
+# ============================================================================ #
+
+
+async def create_guardrail_log(
+    db: AsyncSession,
+    *,
+    request_id: Optional[int] = None,
+    stage: str,
+    violation_type: str,
+    severity: str,
+    action_taken: str,
+    latency_ms: Optional[float] = None,
+    snippet: Optional[str] = None,
+    metadata_json: Optional[str] = None,
+) -> GuardrailLog:
+    """Insert a guardrail violation event and return the persisted row."""
+    row = GuardrailLog(
+        request_id=request_id,
+        stage=stage,
+        violation_type=violation_type,
+        severity=severity,
+        action_taken=action_taken,
+        latency_ms=latency_ms,
+        snippet=snippet,
+        metadata_json=metadata_json,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def get_guardrail_logs(
+    db: AsyncSession,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+    hours: Optional[int] = 24,
+    violation_type: Optional[str] = None,
+    stage: Optional[str] = None,
+) -> List[GuardrailLog]:
+    """Return paginated guardrail violation logs (newest first)."""
+    from datetime import datetime, timedelta, timezone
+
+    query = select(GuardrailLog)
+
+    if hours:
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        query = query.where(GuardrailLog.timestamp >= since)
+    if violation_type:
+        query = query.where(GuardrailLog.violation_type == violation_type)
+    if stage:
+        query = query.where(GuardrailLog.stage == stage)
+
+    query = query.order_by(desc(GuardrailLog.timestamp)).offset(skip).limit(limit)
+    result = await db.execute(query)
+    return list(result.scalars().all())
+
+
+async def get_guardrail_stats(
+    db: AsyncSession,
+    *,
+    hours: int = 24,
+) -> Dict[str, Any]:
+    """Aggregate guardrail violation counts and latency overhead."""
+    from datetime import datetime, timedelta, timezone
+
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    agg = await db.execute(
+        select(
+            func.count(GuardrailLog.id).label("total_violations"),
+            func.avg(GuardrailLog.latency_ms).label("avg_guardrail_latency_ms"),
+            func.sum(
+                func.cast(GuardrailLog.action_taken == "block", Integer)
+            ).label("total_blocked"),
+            func.sum(
+                func.cast(GuardrailLog.action_taken == "redact", Integer)
+            ).label("total_redacted"),
+        ).where(GuardrailLog.timestamp >= since)
+    )
+    row = agg.one()
+
+    by_type = await db.execute(
+        select(
+            GuardrailLog.violation_type,
+            func.count(GuardrailLog.id).label("count"),
+        )
+        .where(GuardrailLog.timestamp >= since)
+        .group_by(GuardrailLog.violation_type)
+    )
+
+    by_stage = await db.execute(
+        select(
+            GuardrailLog.stage,
+            func.count(GuardrailLog.id).label("count"),
+        )
+        .where(GuardrailLog.timestamp >= since)
+        .group_by(GuardrailLog.stage)
+    )
+
+    return {
+        "hours": hours,
+        "total_violations": int(row.total_violations or 0),
+        "avg_guardrail_latency_ms": round(float(row.avg_guardrail_latency_ms or 0), 2),
+        "total_blocked": int(row.total_blocked or 0),
+        "total_redacted": int(row.total_redacted or 0),
+        "by_type": {r.violation_type: int(r.count) for r in by_type.all()},
+        "by_stage": {r.stage: int(r.count) for r in by_stage.all()},
     }
 
 

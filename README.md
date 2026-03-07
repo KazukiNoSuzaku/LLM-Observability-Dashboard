@@ -2,7 +2,7 @@
 
 A production-grade observability system for LLM applications built with FastAPI, Streamlit, Arize Phoenix, and multiple LLM providers (Anthropic, OpenAI, Google Gemini).
 
-Tracks every LLM request and surfaces latency, cost, token usage, error rates, and quality metrics in a real-time dashboard — with automatic alerting, LLM-as-judge scoring, and A/B prompt testing.
+Tracks every LLM request and surfaces latency, cost, token usage, error rates, and quality metrics in a real-time dashboard — with automatic alerting, LLM-as-judge scoring, A/B prompt testing, and a comprehensive Safety & Guardrails layer (PII detection via Microsoft Presidio, jailbreak prevention, and structured output validation via Guardrails AI).
 
 ---
 
@@ -26,6 +26,14 @@ Tracks every LLM request and surfaces latency, cost, token usage, error rates, a
 └──────────┬───────────┘     └──────────┬────────────────┘
            │                             │ direct SQLite read
            ▼                             │
+┌──────────────────────────────────┐     │
+│   GuardrailsService (INPUT)      │     │
+│   · PII scan (Presidio / regex)  │     │
+│   · Jailbreak pattern match      │     │
+│   · Block / redact / log         │     │
+└──────────┬───────────────────────┘     │
+           │                             │
+           ▼                             │
 ┌──────────────────────┐                 │
 │   ObservedLLM        │                 │
 │   llm_wrapper.py     │                 │
@@ -36,14 +44,24 @@ Tracks every LLM request and surfaces latency, cost, token usage, error rates, a
 │  · judge-score resp  │                 │
 │  · emit OTel spans   │                 │
 │  · fire alerts       │                 │
-└──────┬───────────────┘                 │
-       │                                 │
-  ┌────┴─────────────────────────────────┤
+└──────────┬───────────┘                 │
+           │                             │
+           ▼                             │
+┌──────────────────────────────────┐     │
+│   GuardrailsService (OUTPUT)     │     │
+│   · PII redaction (Presidio)     │     │
+│   · Schema validation (Guardrails│     │
+│     AI / Pydantic)               │     │
+│   · Log violations to DB         │     │
+└──────────┬───────────────────────┘     │
+           │                             │
+  ┌────────┴─────────────────────────────┤
   ▼                                      ▼
 ┌──────────────────┐     ┌──────────────────────────┐
 │  SQLite / Postgres│     │  Arize Phoenix :6006     │
 │  llm_requests    │     │  (OTel trace viewer)     │
-└──────────────────┘     └──────────────────────────┘
+│  guardrail_logs  │     └──────────────────────────┘
+└──────────────────┘
            │
            ▼
 ┌──────────────────────────────────┐
@@ -60,6 +78,7 @@ Tracks every LLM request and surfaces latency, cost, token usage, error rates, a
 - Arize Phoenix is **optional** — the app degrades gracefully to a console exporter.
 - Alerting webhooks are **optional** — falls back to `logger.WARNING` if not configured.
 - LLM-as-judge scoring is **opt-in** — set `JUDGE_ENABLED=true` to enable.
+- Guardrails are **opt-in** (default enabled) — Presidio and Guardrails AI are optional installs; the service falls back to compiled regex and basic length checks when they are not present.
 
 ---
 
@@ -75,13 +94,14 @@ LLM-Observability-Dashboard/
 │   │   └── llm_wrapper.py        # ObservedLLM — multi-provider instrumented wrapper
 │   ├── db/
 │   │   ├── database.py            # Async SQLAlchemy engine + incremental migrations
-│   │   ├── models.py              # LLMRequest ORM model
-│   │   └── crud.py                # Async CRUD + aggregate queries
+│   │   ├── models.py              # LLMRequest + GuardrailLog ORM models
+│   │   └── crud.py                # Async CRUD + aggregate queries (incl. guardrail logs)
 │   ├── services/
 │   │   ├── tracing_service.py     # OTel + Phoenix integration
 │   │   ├── metrics_service.py     # Time-series aggregation
 │   │   ├── alerting_service.py    # Slack / Discord webhook alerting
-│   │   └── judge_service.py       # LLM-as-judge auto quality scoring
+│   │   ├── judge_service.py       # LLM-as-judge auto quality scoring
+│   │   └── guardrails_service.py  # PII detection, jailbreak scan, output validation
 │   ├── api/
 │   │   ├── schemas.py             # Pydantic request/response models
 │   │   └── routes.py              # FastAPI router (includes A/B test endpoint)
@@ -198,6 +218,16 @@ python -c "import phoenix as px; session = px.launch_app(); print(session.url); 
 | `JUDGE_ENABLED` | `false` | Auto-score responses after every generation |
 | `JUDGE_MODEL` | `claude-haiku-4-5-20251001` | Model used for scoring (cheap/fast recommended) |
 
+### Guardrails
+
+| Variable | Default | Description |
+|---|---|---|
+| `GUARDRAILS_ENABLED` | `true` | Master on/off switch for all guardrail checks |
+| `GUARDRAILS_BLOCK_ON_PII` | `false` | Block (reject) requests containing PII — if false, PII is redacted |
+| `GUARDRAILS_BLOCK_ON_JAILBREAK` | `true` | Block requests matching jailbreak/prompt-injection patterns |
+| `GUARDRAILS_REDACT_OUTPUT_PII` | `true` | Replace PII in LLM responses with `[REDACTED:TYPE]` placeholders |
+| `GUARDRAILS_USE_PRESIDIO` | `true` | Prefer Presidio for PII — falls back to regex when not installed |
+
 ---
 
 ## API Endpoints
@@ -220,6 +250,8 @@ Interactive docs: **http://localhost:8000/docs**
 | `GET` | `/api/v1/prompts/{name}/compare` | Compare metrics across versions |
 | `POST` | `/api/v1/prompts/{name}/ab-generate` | Run A/B test across two versions |
 | `DELETE` | `/api/v1/prompts/{name}/{version}` | Deactivate a template version |
+| `GET` | `/api/v1/guardrails/logs` | Paginated violation log (PII, jailbreak, output) |
+| `GET` | `/api/v1/guardrails/stats` | Aggregate guardrail stats (counts, latency overhead) |
 
 ### Example: generate with Claude
 
@@ -358,19 +390,116 @@ curl -X POST http://localhost:8000/api/v1/prompts/my-template/ab-generate \
 | Section | What you see |
 |---|---|
 | KPI cards | Total requests, avg/p95 latency, total cost, error rate with status badges and sparklines |
-| Latency chart | Avg + p95 latency over time with alert threshold line |
-| Cost chart | Per-minute cost bars + cumulative cost overlay |
+| Latency chart | Avg + p95 latency over time with Z-score anomaly markers |
+| Cost chart | Per-minute cost bars + cumulative overlay + linear regression forecast |
 | Token chart | Stacked prompt + completion tokens per minute |
 | RPM chart | Requests per minute area chart |
 | Latency histogram | Distribution with avg and p95 markers |
 | Model donut | Request share by model |
 | Provider donut | Request share by provider (Anthropic / OpenAI / Google) |
 | Percentile KPIs | p50 / p99 latency, avg tokens, avg quality score |
-| Request table | Searchable, filterable, truncated prompt/response preview |
+| Request table | Searchable, filterable, truncated prompt/response preview + CSV export |
+| Anomaly Detection | Z-score flagging of latency and cost spikes with worst-Z KPI |
 | Prompt Version Control | Version-by-version latency / cost / feedback bar charts + summary table |
 | A/B Experiment | Head-to-head comparison of two template versions with win/loss verdict |
+| **Safety & Guardrails** | **Violation KPIs, pass/fail donut, latency impact chart, violation log table + CSV** |
+| Policy Manager | Sidebar expander showing live guardrail policy (PII / jailbreak / redaction flags) |
 | Auto-refresh | 10-second refresh toggle in sidebar |
 | Phoenix link | One-click link to trace viewer |
+
+---
+
+## Safety & Guardrails
+
+The guardrails layer sits as middleware around every LLM call. It is enabled by default and requires no extra API keys.
+
+### Three validation layers
+
+**1. PII Detection (input + output)**
+
+Uses Microsoft Presidio when installed, with a compiled-regex fallback. Detects:
+- `EMAIL_ADDRESS`, `PHONE_NUMBER`, `US_SSN`, `CREDIT_CARD`, `IP_ADDRESS`
+- `AWS_ACCESS_KEY`, `API_KEY_BEARER` (Bearer tokens, API keys)
+
+```env
+GUARDRAILS_USE_PRESIDIO=true   # use Presidio (install separately)
+GUARDRAILS_BLOCK_ON_PII=false  # redact instead of blocking (default)
+GUARDRAILS_REDACT_OUTPUT_PII=true
+```
+
+Install Presidio (requires spaCy English model):
+```bash
+pip install presidio-analyzer presidio-anonymizer
+python -m spacy download en_core_web_lg
+```
+
+**2. Jailbreak / Prompt-Injection Detection (input)**
+
+10 compiled regex patterns covering:
+- DAN (Do Anything Now) variants
+- Instruction-override (`ignore all previous instructions`)
+- System-prompt leakage (`repeat your system prompt`)
+- Role-play bypasses (`pretend you are an uncensored AI`)
+- Developer / god mode activation
+- Base64-encoded payload injection
+- Competitor impersonation
+- Prompt-injection XML tags (`<system>`, `<instruction>`)
+
+```env
+GUARDRAILS_BLOCK_ON_JAILBREAK=true   # hard block (default)
+```
+
+**3. Structured Output Validation (output)**
+
+Uses Guardrails AI when installed to validate responses via a Pydantic schema. Falls back to length/content checks.
+
+```bash
+pip install guardrails-ai
+# Optional hub validator (requires account):
+guardrails hub install hub://guardrails/toxic_language
+```
+
+### Violation events
+
+Every guardrail trigger is persisted to the `guardrail_logs` table with:
+- `stage` — `"input"` or `"output"`
+- `violation_type` — `"pii"`, `"jailbreak"`, `"output_invalid"`
+- `severity` — `"low"`, `"medium"`, `"high"`, `"critical"`
+- `action_taken` — `"pass"`, `"block"`, `"redact"`, `"log"`
+- `latency_ms` — guardrail check overhead in milliseconds
+- `snippet` — truncated prompt/response (200 chars) for audit
+
+### Dashboard: Safety & Guardrails section
+
+- **5 KPI cards** — Total violations, Blocked, PII detections, Jailbreak attempts, Avg guard latency
+- **Pass/Fail Ratio donut** — action distribution (pass / block / redact / log)
+- **Latency Impact chart** — guardrail overhead vs raw LLM latency per time bucket
+- **Violations by Type** — stacked time-series bar chart (PII / jailbreak / output_invalid)
+- **Input vs Output** donut split
+- **Violation Log table** — filterable, sortable, with CSV export
+- **Policy Manager** — sidebar expander showing live policy flags
+
+### Query guardrail data via API
+
+```bash
+# Paginated violation log
+curl http://localhost:8000/api/v1/guardrails/logs?hours=24 | jq .
+
+# Aggregate stats
+curl http://localhost:8000/api/v1/guardrails/stats | jq .
+```
+
+```json
+{
+  "hours": 24,
+  "total_violations": 12,
+  "avg_guardrail_latency_ms": 3.4,
+  "total_blocked": 2,
+  "total_redacted": 7,
+  "by_type": {"pii": 8, "jailbreak": 2, "output_invalid": 2},
+  "by_stage": {"input": 9, "output": 3}
+}
+```
 
 ---
 
@@ -395,6 +524,7 @@ Every call to `ObservedLLM.generate()` automatically emits a span when `PHOENIX_
 ## Database Schema
 
 ```sql
+-- Main request log
 CREATE TABLE llm_requests (
     id                      INTEGER  PRIMARY KEY AUTOINCREMENT,
     timestamp               DATETIME NOT NULL,          -- UTC
@@ -417,9 +547,23 @@ CREATE TABLE llm_requests (
     prompt_template_version INTEGER,
     prompt_variables        TEXT                        -- JSON
 );
+
+-- Guardrail violation events
+CREATE TABLE guardrail_logs (
+    id               INTEGER  PRIMARY KEY AUTOINCREMENT,
+    request_id       INTEGER  REFERENCES llm_requests(id) ON DELETE SET NULL,
+    timestamp        DATETIME NOT NULL,
+    stage            VARCHAR(20) NOT NULL,               -- "input" | "output"
+    violation_type   VARCHAR(50) NOT NULL,               -- "pii" | "jailbreak" | "output_invalid"
+    severity         VARCHAR(20) NOT NULL,               -- "low" | "medium" | "high" | "critical"
+    action_taken     VARCHAR(20) NOT NULL,               -- "pass" | "block" | "redact" | "log"
+    latency_ms       FLOAT,                              -- guardrail check overhead
+    snippet          TEXT,                               -- truncated prompt/response (200 chars)
+    metadata_json    TEXT                                -- JSON: pii_types, patterns, reasons
+);
 ```
 
-Schema migrations are applied automatically on startup via `_migrate_columns()` in `database.py` — no migration tool required.
+Both tables are created automatically on startup. Schema migrations are applied incrementally via `_migrate_columns()` in `database.py` — no migration tool required.
 
 ---
 
@@ -431,3 +575,6 @@ Schema migrations are applied automatically on startup via `_migrate_columns()` 
 - **Custom judge prompts**: Edit `_SYSTEM_PROMPT` in `services/judge_service.py`.
 - **LangSmith tracing**: Replace `TracingService` with a LangSmith callback handler and `@traceable` decorator.
 - **Authentication**: Add `fastapi-users` or OAuth2 middleware to `main.py`.
+- **Custom guardrail patterns**: Add entries to `_JAILBREAK_PATTERNS` or `_REGEX_PII` in `services/guardrails_service.py`.
+- **Presidio custom recognisers**: Extend `_presidio_scan_pii()` with a `PatternRecognizer` for domain-specific entities (e.g. employee IDs, medical record numbers).
+- **NeMo Guardrails**: Replace `_guardrails_validate_output()` with a `LLMRails` call for dialogue-flow and topic guardrails.

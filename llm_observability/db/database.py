@@ -71,6 +71,16 @@ async def _migrate_columns(conn) -> None:  # type: ignore[no-untyped-def]
         ("llm_requests", "prompt_template_version", "INTEGER"),
         ("llm_requests", "prompt_variables",        "TEXT"),
         ("llm_requests", "provider",                "VARCHAR(50)"),
+        # guardrail_logs is a new table (created by create_all),
+        # but we guard against partial deployments with these entries:
+        ("guardrail_logs", "request_id",     "INTEGER"),
+        ("guardrail_logs", "stage",          "VARCHAR(20)"),
+        ("guardrail_logs", "violation_type", "VARCHAR(50)"),
+        ("guardrail_logs", "severity",       "VARCHAR(20)"),
+        ("guardrail_logs", "action_taken",   "VARCHAR(20)"),
+        ("guardrail_logs", "latency_ms",     "REAL"),
+        ("guardrail_logs", "snippet",        "TEXT"),
+        ("guardrail_logs", "metadata_json",  "TEXT"),
     ]
     for table, column, col_type in new_columns:
         try:

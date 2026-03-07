@@ -570,6 +570,34 @@ def _layout(h: int = CHART_H, **kw) -> dict:
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=10, show_spinner=False)
+def load_guardrail_logs(hours: int) -> pd.DataFrame:
+    """Load guardrail violation events from the DB (direct SQLite read)."""
+    if not os.path.exists(DB_PATH):
+        return pd.DataFrame()
+    since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT id, request_id, timestamp, stage, violation_type,
+                   severity, action_taken, latency_ms, snippet
+            FROM guardrail_logs
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC
+            """,
+            conn,
+            params=[since],
+        )
+        if not df.empty:
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+        return df
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=10, show_spinner=False)
 def load_data(hours: int, model_filter: str) -> pd.DataFrame:
     if not os.path.exists(DB_PATH):
         return pd.DataFrame()
@@ -751,6 +779,52 @@ with st.sidebar:
                 }
         else:
             st.caption("No models in database yet.")
+
+    st.markdown("<hr/>", unsafe_allow_html=True)
+
+    # Guardrails Policy Manager
+    st.markdown(
+        "<div style='font-size:0.62rem;font-weight:700;letter-spacing:0.12em;"
+        "text-transform:uppercase;color:#64748b;margin-bottom:10px'>Guardrails Policy</div>",
+        unsafe_allow_html=True,
+    )
+    with st.expander("Policy Manager"):
+        st.markdown(
+            "<div style='font-size:0.62rem;color:#475569;margin-bottom:10px'>"
+            "Runtime policy — changes take effect after server restart "
+            "or by updating <code style='font-size:0.60rem'>.env</code>.</div>",
+            unsafe_allow_html=True,
+        )
+        _gr_enabled      = os.getenv("GUARDRAILS_ENABLED",           "true").lower() == "true"
+        _gr_block_pii    = os.getenv("GUARDRAILS_BLOCK_ON_PII",      "false").lower() == "true"
+        _gr_block_jb     = os.getenv("GUARDRAILS_BLOCK_ON_JAILBREAK","true").lower() == "true"
+        _gr_redact_out   = os.getenv("GUARDRAILS_REDACT_OUTPUT_PII", "true").lower() == "true"
+        _gr_use_presidio = os.getenv("GUARDRAILS_USE_PRESIDIO",      "true").lower() == "true"
+
+        def _policy_row(label: str, active: bool) -> str:
+            dot = "#10b981" if active else "#475569"
+            state = "ON" if active else "OFF"
+            return (
+                f"<div style='display:flex;justify-content:space-between;"
+                f"align-items:center;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04)'>"
+                f"<span style='font-size:0.68rem;color:#94a3b8'>{label}</span>"
+                f"<span style='font-size:0.60rem;font-weight:700;color:{dot}'>{state}</span></div>"
+            )
+
+        st.markdown(
+            _policy_row("Guardrails Enabled",        _gr_enabled)
+            + _policy_row("Block on PII",            _gr_block_pii)
+            + _policy_row("Block on Jailbreak",      _gr_block_jb)
+            + _policy_row("Redact Output PII",       _gr_redact_out)
+            + _policy_row("Use Presidio (vs Regex)", _gr_use_presidio),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<div style='font-size:0.60rem;color:#475569;margin-top:8px'>"
+            "Install Presidio: <code>pip install presidio-analyzer presidio-anonymizer</code><br/>"
+            "Install Guardrails AI: <code>pip install guardrails-ai</code></div>",
+            unsafe_allow_html=True,
+        )
 
     st.markdown("<hr/>", unsafe_allow_html=True)
     auto_refresh = st.checkbox("Auto-refresh (10 s)", value=False)
@@ -1671,6 +1745,266 @@ else:
                 f"<span style='color:#475569'>based on latency, cost, and quality score</span></div>",
                 unsafe_allow_html=True,
             )
+
+# ===========================================================================
+# Safety & Guardrails
+# ===========================================================================
+st.markdown(_sec("Safety & Guardrails"), unsafe_allow_html=True)
+st.markdown(
+    "<div style='font-size:0.74rem;color:#475569;margin-bottom:16px'>"
+    "Real-time input/output validation — PII detection (Presidio), jailbreak prevention, "
+    "and structured output validation (Guardrails AI).</div>",
+    unsafe_allow_html=True,
+)
+
+gr_df = load_guardrail_logs(time_range)
+
+if gr_df.empty:
+    st.info(
+        "No guardrail events in this window. "
+        "Violations are logged automatically when GUARDRAILS_ENABLED=true."
+    )
+else:
+    # ---- KPI row ------------------------------------------------------ #
+    _total_vio  = len(gr_df)
+    _blocked    = int((gr_df["action_taken"] == "block").sum())
+    _redacted   = int((gr_df["action_taken"] == "redact").sum())
+    _pii_count  = int((gr_df["violation_type"] == "pii").sum())
+    _jb_count   = int((gr_df["violation_type"] == "jailbreak").sum())
+    _avg_gr_lat = gr_df["latency_ms"].mean() or 0.0
+
+    gc1, gc2, gc3, gc4, gc5 = st.columns(5)
+
+    with gc1:
+        c = "#f43f5e" if _total_vio > 0 else "#10b981"
+        st.markdown(
+            f"""<div class="kpi-card {'cr' if _total_vio > 0 else 'ce'} k1">
+              <div><div class="kpi-label">Total Violations</div>
+              <div class="kpi-value" style="color:{c} !important">{_total_vio}</div></div>
+              <div class="kpi-footer">
+                <span class="kpi-badge {'berr' if _total_vio > 0 else 'bok'}">
+                  {'Active' if _total_vio > 0 else 'Clean'}</span>
+              </div></div>""",
+            unsafe_allow_html=True,
+        )
+    with gc2:
+        st.markdown(
+            f"""<div class="kpi-card cr k2">
+              <div><div class="kpi-label">Blocked Requests</div>
+              <div class="kpi-value">{_blocked}</div></div>
+              <div class="kpi-footer">
+                <span class="kpi-badge berr">Hard block</span>
+              </div></div>""",
+            unsafe_allow_html=True,
+        )
+    with gc3:
+        st.markdown(
+            f"""<div class="kpi-card ca k3">
+              <div><div class="kpi-label">PII Detections</div>
+              <div class="kpi-value">{_pii_count}</div></div>
+              <div class="kpi-footer">
+                <span class="kpi-badge bwarn">Presidio / Regex</span>
+              </div></div>""",
+            unsafe_allow_html=True,
+        )
+    with gc4:
+        st.markdown(
+            f"""<div class="kpi-card cv k4">
+              <div><div class="kpi-label">Jailbreak Attempts</div>
+              <div class="kpi-value">{_jb_count}</div></div>
+              <div class="kpi-footer">
+                <span class="kpi-badge bvio">Pattern match</span>
+              </div></div>""",
+            unsafe_allow_html=True,
+        )
+    with gc5:
+        st.markdown(
+            f"""<div class="kpi-card cc k5">
+              <div><div class="kpi-label">Avg Guard Latency</div>
+              <div class="kpi-value">{_avg_gr_lat:.1f}</div>
+              <div class="kpi-sub">milliseconds</div></div>
+              <div class="kpi-footer">
+                <span class="kpi-badge bcyn">Overhead</span>
+              </div></div>""",
+            unsafe_allow_html=True,
+        )
+
+    # ---- Charts row --------------------------------------------------- #
+    gr_c1, gr_c2 = st.columns(2)
+
+    with gr_c1:
+        # Pass / Fail ratio donut
+        st.markdown(_cc("Pass / Fail Ratio", "action distribution"), unsafe_allow_html=True)
+        _action_counts = gr_df["action_taken"].value_counts().reset_index()
+        _action_counts.columns = ["action", "count"]
+        ACTION_COLORS = {
+            "pass":   "#10b981",
+            "block":  "#f43f5e",
+            "redact": "#f59e0b",
+            "log":    "#6366f1",
+        }
+        _colors = [ACTION_COLORS.get(a, "#8b5cf6") for a in _action_counts["action"]]
+        fig = px.pie(
+            _action_counts, values="count", names="action", hole=0.58,
+            color_discrete_sequence=_colors,
+        )
+        fig.update_traces(
+            textposition="inside", textinfo="percent",
+            textfont=dict(size=11, color="#f1f5f9"),
+            marker=dict(line=dict(color="rgba(0,0,0,0)", width=0)),
+            pull=[0.03] * len(_action_counts),
+        )
+        fig.update_layout(**_layout(
+            CHART_H,
+            legend=dict(orientation="v", x=0.78, y=0.5,
+                        font=dict(size=10, color="#64748b"), bgcolor="rgba(0,0,0,0)"),
+        ))
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with gr_c2:
+        # Latency Impact chart — guardrail overhead vs LLM latency per bucket
+        st.markdown(_cc("Latency Impact", "guardrail overhead vs LLM"), unsafe_allow_html=True)
+
+        if not gr_df.empty and not ok.empty:
+            _gr_lat_ts = (
+                gr_df.set_index("timestamp")
+                .resample("1min")["latency_ms"]
+                .mean()
+                .reset_index()
+                .rename(columns={"latency_ms": "guard_latency"})
+            )
+            _llm_lat_ts = (
+                ok.set_index("timestamp")
+                .resample("1min")["latency_ms"]
+                .mean()
+                .reset_index()
+                .rename(columns={"latency_ms": "llm_latency"})
+            )
+            _combined = pd.merge(_gr_lat_ts, _llm_lat_ts, on="timestamp", how="outer").dropna()
+
+            if not _combined.empty:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=_combined["timestamp"], y=_combined["llm_latency"],
+                    name="LLM Latency",
+                    line=dict(color="#6366f1", width=2.5, shape="spline"),
+                    fill="tozeroy",
+                    fillcolor=_grad_fill("#6366f1", 0.08),
+                ))
+                fig.add_trace(go.Scatter(
+                    x=_combined["timestamp"], y=_combined["guard_latency"],
+                    name="Guardrail Overhead",
+                    line=dict(color="#f59e0b", width=2, shape="spline", dash="dot"),
+                ))
+                fig.update_layout(**_layout(CHART_H, yaxis_title="ms"))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Not enough overlapping data for latency comparison.")
+        else:
+            st.info("Not enough data.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---- Violation type breakdown ------------------------------------- #
+    gr_c3, gr_c4 = st.columns(2)
+
+    with gr_c3:
+        st.markdown(_cc("Violations by Type", "over time"), unsafe_allow_html=True)
+        if not gr_df.empty:
+            _vio_ts = (
+                gr_df.set_index("timestamp")
+                .groupby([pd.Grouper(freq="5min"), "violation_type"])
+                .size()
+                .reset_index(name="count")
+            )
+            if not _vio_ts.empty:
+                TYPE_COLORS = {
+                    "pii":            "#f59e0b",
+                    "jailbreak":      "#f43f5e",
+                    "output_invalid": "#8b5cf6",
+                    "none":           "#475569",
+                }
+                fig = go.Figure()
+                for vtype in _vio_ts["violation_type"].unique():
+                    _sub = _vio_ts[_vio_ts["violation_type"] == vtype]
+                    fig.add_trace(go.Bar(
+                        x=_sub["timestamp"], y=_sub["count"],
+                        name=vtype,
+                        marker_color=TYPE_COLORS.get(vtype, "#6366f1"),
+                        marker_opacity=0.85,
+                        marker_line_width=0,
+                    ))
+                fig.update_layout(**_layout(CHART_H, barmode="stack", yaxis_title="Events"))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Not enough data.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with gr_c4:
+        st.markdown(_cc("Input vs Output Violations", "stage split"), unsafe_allow_html=True)
+        if not gr_df.empty:
+            _stage_counts = gr_df["stage"].value_counts().reset_index()
+            _stage_counts.columns = ["stage", "count"]
+            fig = px.pie(
+                _stage_counts, values="count", names="stage", hole=0.58,
+                color_discrete_sequence=["#06b6d4", "#8b5cf6"],
+            )
+            fig.update_traces(
+                textposition="inside", textinfo="percent+label",
+                textfont=dict(size=11, color="#f1f5f9"),
+                marker=dict(line=dict(color="rgba(0,0,0,0)", width=0)),
+                pull=[0.03] * len(_stage_counts),
+            )
+            fig.update_layout(**_layout(
+                CHART_H,
+                legend=dict(orientation="h", y=-0.05, x=0.2,
+                            font=dict(size=10, color="#64748b")),
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---- Violation Logs table ----------------------------------------- #
+    st.markdown(
+        "<div style='font-size:0.68rem;font-weight:700;color:#64748b;"
+        "letter-spacing:0.05em;margin:18px 0 8px'>Violation Log</div>",
+        unsafe_allow_html=True,
+    )
+    _gf1, _gf2 = st.columns([2, 1])
+    with _gf1:
+        _vio_filter = st.selectbox(
+            "Filter by type",
+            ["All", "pii", "jailbreak", "output_invalid"],
+            key="gr_type_filter",
+        )
+    with _gf2:
+        _gr_rows = st.selectbox("Show rows", [10, 25, 50], index=0, key="gr_rows")
+
+    _gr_disp = gr_df.copy()
+    if _vio_filter != "All":
+        _gr_disp = _gr_disp[_gr_disp["violation_type"] == _vio_filter]
+    _gr_disp = _gr_disp.head(_gr_rows)[
+        ["timestamp", "stage", "violation_type", "severity",
+         "action_taken", "latency_ms", "snippet"]
+    ].copy()
+    _gr_disp.columns = ["Timestamp", "Stage", "Type", "Severity", "Action", "Guard ms", "Snippet"]
+    _gr_disp["Timestamp"] = _gr_disp["Timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    _gr_disp["Guard ms"]  = _gr_disp["Guard ms"].apply(
+        lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+    )
+    st.dataframe(
+        _gr_disp, use_container_width=True, hide_index=True,
+        column_config={"Snippet": st.column_config.TextColumn(width="large")},
+    )
+
+    # CSV export
+    _gr_csv = _gr_disp.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download violation log CSV",
+        data=_gr_csv,
+        file_name=f"guardrail_violations_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+        key="dl_guardrails",
+    )
 
 # ---------------------------------------------------------------------------
 # Footer

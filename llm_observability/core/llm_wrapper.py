@@ -1,15 +1,17 @@
 """ObservedLLM — instrumented wrapper around multiple LLM providers.
 
 Every call to ``generate()`` automatically:
-  1. Detects the provider from the model name and routes to the correct SDK.
-  2. Resolves a versioned prompt template (if provided) and renders variables.
-  3. Records wall-clock latency.
-  4. Extracts token usage from the API response.
-  5. Calculates estimated cost using model pricing tables.
-  6. Emits an OpenTelemetry span (forwarded to Arize Phoenix if configured).
-  7. Auto-scores the response with JudgeService (if JUDGE_ENABLED=true).
-  8. Persists the full trace record to the DB.
-  9. Fires async webhook alerts (Slack/Discord) when thresholds are breached.
+  1.  Detects the provider from the model name and routes to the correct SDK.
+  2.  Resolves a versioned prompt template (if provided) and renders variables.
+  3.  Runs INPUT guardrails (PII detection / jailbreak scan via GuardrailsService).
+  4.  Records wall-clock latency.
+  5.  Extracts token usage from the API response.
+  6.  Calculates estimated cost using model pricing tables.
+  7.  Emits an OpenTelemetry span (forwarded to Arize Phoenix if configured).
+  8.  Auto-scores the response with JudgeService (if JUDGE_ENABLED=true).
+  9.  Runs OUTPUT guardrails (PII redaction / structured output validation).
+  10. Persists the full trace record + guardrail violation events to the DB.
+  11. Fires async webhook alerts (Slack/Discord) when thresholds are breached.
 
 Supported providers
 -------------------
@@ -140,6 +142,20 @@ class ObservedLLM:
             if system is None and tpl.system_prompt:
                 system = tpl.system_prompt
 
+        # ---- INPUT guardrails ----------------------------------------- #
+        from llm_observability.services.guardrails_service import GuardrailsService
+
+        input_guard = GuardrailsService.scan_input(prompt)
+        if input_guard.blocked:
+            # Persist the violation before raising so it appears in the logs
+            async with AsyncSessionLocal() as db:
+                for vrow in input_guard.to_log_rows("input"):
+                    await crud.create_guardrail_log(db, **vrow)
+            raise ValueError(input_guard.block_reason)
+
+        # Use redacted prompt for the LLM call when PII was found
+        effective_prompt = input_guard.pii_redacted_text or prompt
+
         # ---- instrumented generation ---------------------------------- #
         trace_id = str(uuid.uuid4())
         start_time = time.monotonic()
@@ -148,6 +164,7 @@ class ObservedLLM:
         error_text: Optional[str] = None
         prompt_tokens = 0
         completion_tokens = 0
+        output_guard = None
 
         span_attrs: Dict[str, Any] = {
             "llm.model": self.model,
@@ -162,17 +179,24 @@ class ObservedLLM:
         with self._tracer.start_as_current_span("llm.generate", attributes=span_attrs) as span:
             try:
                 response_text, prompt_tokens, completion_tokens = await self._call_provider(
-                    prompt=prompt, system=system
+                    prompt=effective_prompt, system=system
                 )
 
                 span.set_attribute("llm.prompt_tokens", prompt_tokens)
                 span.set_attribute("llm.completion_tokens", completion_tokens)
                 span.set_attribute("llm.response_length", len(response_text or ""))
 
+                # ---- OUTPUT guardrails -------------------------------- #
+                output_guard = None
+                if response_text:
+                    output_guard = GuardrailsService.scan_output(response_text)
+                    if output_guard.pii_redacted_text:
+                        response_text = output_guard.pii_redacted_text
+
                 # ---- auto-judge (skipped when explicit feedback_score provided) #
                 if response_text and feedback_score is None:
                     from llm_observability.services.judge_service import JudgeService
-                    judge_score, _ = await JudgeService.score(prompt, response_text)
+                    judge_score, _ = await JudgeService.score(effective_prompt, response_text)
                     if judge_score is not None:
                         feedback_score = judge_score
 
@@ -194,9 +218,9 @@ class ObservedLLM:
                 span.set_attribute("llm.estimated_cost_usd", estimated_cost)
 
                 async with AsyncSessionLocal() as db:
-                    await crud.create_request(
+                    req_row = await crud.create_request(
                         db=db,
-                        prompt=prompt,
+                        prompt=effective_prompt,
                         response=response_text,
                         model_name=self.model,
                         provider=self.provider,
@@ -216,6 +240,14 @@ class ObservedLLM:
                             json.dumps(variables) if variables else None
                         ),
                     )
+
+                    # Persist guardrail violation events
+                    _rid = req_row.id
+                    for vrow in input_guard.to_log_rows("input"):
+                        await crud.create_guardrail_log(db, request_id=_rid, **vrow)
+                    if output_guard:
+                        for vrow in output_guard.to_log_rows("output"):
+                            await crud.create_guardrail_log(db, request_id=_rid, **vrow)
 
                 await self._check_alerts(latency_ms=latency_ms, cost=estimated_cost)
 

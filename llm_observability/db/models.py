@@ -231,3 +231,57 @@ class LLMRequest(Base):
             f"<LLMRequest id={self.id} model={self.model_name} "
             f"latency={self.latency_ms:.0f}ms cost=${self.estimated_cost:.6f}>"
         )
+
+
+class GuardrailLog(Base):
+    """One row per guardrail violation event.
+
+    Linked to a parent LLMRequest but persisted independently so that
+    violation analytics can be queried without joining the full request table.
+    """
+
+    __tablename__ = "guardrail_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Link to the parent request (nullable — blocked requests may have no row)
+    request_id = Column(
+        Integer,
+        ForeignKey("llm_requests.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    timestamp = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        index=True,
+    )
+
+    # "input" or "output"
+    stage = Column(String(20), nullable=False)
+
+    # "pii" | "jailbreak" | "output_invalid" | "none"
+    violation_type = Column(String(50), nullable=False, index=True)
+
+    # "none" | "low" | "medium" | "high" | "critical"
+    severity = Column(String(20), nullable=False)
+
+    # "pass" | "block" | "redact" | "log"
+    action_taken = Column(String(20), nullable=False)
+
+    # Guardrail check overhead in milliseconds
+    latency_ms = Column(Float, nullable=True)
+
+    # Truncated prompt/response snippet (first 200 chars)
+    snippet = Column(Text, nullable=True)
+
+    # JSON blob — pii_types, jailbreak_patterns, etc.
+    metadata_json = Column(Text, nullable=True)
+
+    def __repr__(self) -> str:
+        return (
+            f"<GuardrailLog id={self.id} stage={self.stage!r} "
+            f"type={self.violation_type!r} action={self.action_taken!r}>"
+        )

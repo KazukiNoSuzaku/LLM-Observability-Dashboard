@@ -227,3 +227,37 @@ class TimeSeriesBucket(BaseModel):
     total_cost: float
     total_tokens: int
     error_count: int
+
+
+# ============================================================================ #
+# Guardrails schemas
+# ============================================================================ #
+
+
+class GuardrailLogResponse(BaseModel):
+    """One guardrail violation event from GET /api/v1/guardrails/logs."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    request_id: Optional[int]
+    timestamp: datetime
+    stage: str
+    violation_type: str
+    severity: str
+    action_taken: str
+    latency_ms: Optional[float]
+    snippet: Optional[str]
+    metadata_json: Optional[str]
+
+
+class GuardrailStatsResponse(BaseModel):
+    """Aggregate guardrail stats from GET /api/v1/guardrails/stats."""
+
+    hours: int
+    total_violations: int
+    avg_guardrail_latency_ms: float
+    total_blocked: int
+    total_redacted: int
+    by_type: Dict[str, int]
+    by_stage: Dict[str, int]
