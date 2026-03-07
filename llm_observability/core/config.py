@@ -162,6 +162,28 @@ class Settings(BaseSettings):
             "falls back to compiled regex if presidio-analyzer is not available"
         ),
     )
+    guardrails_nemo_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable NVIDIA NeMo Guardrails LLMRails for dialogue-flow and topic "
+            "enforcement (input + output rails). Requires 'nemoguardrails' package "
+            "and at least one LLM API key (OpenAI or Anthropic)."
+        ),
+    )
+    guardrails_nemo_engine: str = Field(
+        default="auto",
+        description=(
+            "LLM engine for NeMo validation calls: 'auto' (auto-detect from API keys), "
+            "'openai', or 'anthropic'."
+        ),
+    )
+    guardrails_nemo_model: str = Field(
+        default="gpt-4o-mini",
+        description=(
+            "Model used for NeMo validation LLM calls. "
+            "Use a fast, cheap model — each guardrail check adds a secondary LLM call."
+        ),
+    )
 
 
 # Module-level singleton — import from here everywhere

@@ -149,7 +149,7 @@ class ObservedLLM:
         # ---- INPUT guardrails ----------------------------------------- #
         from llm_observability.services.guardrails_service import GuardrailsService
 
-        input_guard = GuardrailsService.scan_input(prompt)
+        input_guard = await GuardrailsService.scan_input(prompt)
         if input_guard.blocked:
             # Persist the violation before raising so it appears in the logs
             async with AsyncSessionLocal() as db:
@@ -193,7 +193,9 @@ class ObservedLLM:
                 # ---- OUTPUT guardrails -------------------------------- #
                 output_guard = None
                 if response_text:
-                    output_guard = GuardrailsService.scan_output(response_text)
+                    output_guard = await GuardrailsService.scan_output(
+                        response_text, prompt=effective_prompt
+                    )
                     if output_guard.pii_redacted_text:
                         response_text = output_guard.pii_redacted_text
 

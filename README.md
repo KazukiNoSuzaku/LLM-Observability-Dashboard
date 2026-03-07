@@ -209,20 +209,22 @@ Every call — regardless of provider — writes to the same `llm_requests` tabl
 
 ## Safety & Guardrails
 
-Every LLM call passes through a two-stage validation middleware — no extra API keys required.
+Every LLM call passes through a four-layer validation middleware. Layers 1–3 are zero-config. Layer 4 (NeMo) is optional and adds LLM-as-judge dialogue-flow enforcement.
 
 ```
 User Prompt
     │
-    ▼  INPUT GUARDRAILS
-    ├─ PII scan (Presidio or regex)  ──→  block or redact
-    └─ Jailbreak detection (10 patterns)  ──→  block or log
+    ▼  INPUT GUARDRAILS  (scan_input — async)
+    ├─ Layer 1: PII scan (Presidio or regex)  ──→  block or redact
+    ├─ Layer 2: Jailbreak detection (10 regex)  ──→  block or log
+    └─ Layer 4: NeMo self_check_input (LLMRails)  ──→  block or log [optional]
     │
     ▼  LLM API Call
     │
-    ▼  OUTPUT GUARDRAILS
-    ├─ PII redaction (Presidio)
-    └─ Schema validation (Guardrails AI / Pydantic)
+    ▼  OUTPUT GUARDRAILS  (scan_output — async)
+    ├─ Layer 4: NeMo self_check_output (LLMRails)  ──→  log [optional]
+    ├─ Layer 3: Schema validation (Guardrails AI / Pydantic)
+    └─ Layer 1: PII redaction (Presidio)
     │
     ▼  violation events written to guardrail_logs
 ```
@@ -272,6 +274,42 @@ pip install guardrails-ai
 guardrails hub install hub://guardrails/toxic_language
 ```
 
+### Layer 4 — NeMo Guardrails: Dialogue-Flow & Topic Rails (input + output)
+
+**NVIDIA NeMo Guardrails** (`nemoguardrails`) adds LLM-as-judge validation via `LLMRails`. A secondary LLM call evaluates each input/response against a configurable safety policy using NeMo's built-in `self_check_input` and `self_check_output` actions.
+
+| NeMo rail | Triggered by | Action |
+|---|---|---|
+| `self_check_input` | Off-policy user prompt | Block + log `nemo` violation |
+| `self_check_output` | Unsafe/non-compliant response | Log `nemo` violation |
+
+**Policy enforced** (configurable via `_NEMO_PROMPTS_YAML` in [services/guardrails_service.py](llm_observability/services/guardrails_service.py)):
+- No harmful, illegal, or dangerous instructions
+- No explicit or adult content
+- No hate speech or discrimination
+- No PII in responses
+- No jailbreak / role-play bypass attempts
+- No instructions for weapons, malware, or illegal activities
+
+**Setup:**
+```bash
+# Install NeMo + LangChain adapter for your chosen validation LLM:
+pip install nemoguardrails langchain-openai      # OpenAI as validator
+# or:
+pip install nemoguardrails langchain-anthropic   # Anthropic as validator
+```
+
+```env
+# .env
+GUARDRAILS_NEMO_ENABLED=true
+GUARDRAILS_NEMO_ENGINE=auto        # auto-detects from OPENAI_API_KEY / ANTHROPIC_API_KEY
+GUARDRAILS_NEMO_MODEL=gpt-4o-mini  # fast model recommended — each check = 1 LLM call
+```
+
+> NeMo validation adds ~500–1500 ms latency per request (one extra LLM call). Use a small, fast model (`gpt-4o-mini`, `claude-haiku`) to minimise overhead. The NeMo rails singleton is cached after first initialisation.
+
+**Architecture note**: Both `scan_input()` and `scan_output()` are `async def` to support `await rails.generate_async(...)`. The NeMo config is built dynamically from app settings — no static config files required.
+
 ### Violation events
 
 Every trigger is persisted to `guardrail_logs`:
@@ -279,7 +317,7 @@ Every trigger is persisted to `guardrail_logs`:
 | Field | Values |
 |---|---|
 | `stage` | `input` / `output` |
-| `violation_type` | `pii` / `jailbreak` / `output_invalid` |
+| `violation_type` | `pii` / `jailbreak` / `output_invalid` / `nemo` |
 | `severity` | `low` / `medium` / `high` / `critical` |
 | `action_taken` | `pass` / `block` / `redact` / `log` |
 | `latency_ms` | guardrail check overhead |
@@ -562,7 +600,7 @@ Each span includes `llm.model`, `llm.provider`, `llm.prompt_tokens`, `llm.comple
 - **Supabase / PostgreSQL**: See the [Supabase Setup](#supabase--postgresql-setup) section above — change `DATABASE_URL` and `pip install asyncpg psycopg2-binary`.
 - **Custom guardrail patterns**: Add to `_JAILBREAK_PATTERNS` or `_REGEX_PII` in [services/guardrails_service.py](llm_observability/services/guardrails_service.py).
 - **Presidio custom recognisers**: Extend `_presidio_scan_pii()` with a `PatternRecognizer` for domain entities (e.g. employee IDs, medical record numbers).
-- **NeMo Guardrails**: Replace `_guardrails_validate_output()` with an `LLMRails` call for dialogue-flow and topic guardrails.
+- **NeMo custom topics**: Extend `_NEMO_PROMPTS_YAML` or `_NEMO_COLANG_CONTENT` in [services/guardrails_service.py](llm_observability/services/guardrails_service.py) to add domain-specific topic restrictions or dialogue flows. Enable with `GUARDRAILS_NEMO_ENABLED=true`.
 - **PagerDuty / Teams alerting**: Add a handler to [services/alerting_service.py](llm_observability/services/alerting_service.py).
 - **Custom judge prompts**: Edit `_SYSTEM_PROMPT` in [services/judge_service.py](llm_observability/services/judge_service.py).
 - **LangSmith tracing**: Replace `TracingService` with a LangSmith callback handler.
