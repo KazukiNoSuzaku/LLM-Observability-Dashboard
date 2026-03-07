@@ -17,7 +17,7 @@ Track every LLM request across **four providers** (Anthropic, OpenAI, Google Gem
 | **Anomaly detection** | Z-score flagging of latency and cost spikes with per-bucket analysis |
 | **Cost forecasting** | Linear regression on cumulative cost trend with a forward projection |
 | **A/B prompt testing** | Run two template versions in parallel and get a head-to-head verdict |
-| **Webhook alerting** | Slack + Discord alerts with per-model thresholds and cooldown dedup |
+| **Webhook alerting** | Slack, Discord, PagerDuty, and Microsoft Teams alerts with per-model thresholds and cooldown dedup |
 | **Real-time dashboard** | 10-section Streamlit UI reading SQLite directly — no API server required |
 
 ---
@@ -115,7 +115,7 @@ LLM-Observability-Dashboard/
 │   ├── services/
 │   │   ├── tracing_service.py      # OpenTelemetry + Arize Phoenix integration
 │   │   ├── metrics_service.py      # Time-series bucketing
-│   │   ├── alerting_service.py     # Slack / Discord webhook alerting
+│   │   ├── alerting_service.py     # Slack / Discord / PagerDuty / Teams alerting
 │   │   ├── judge_service.py        # LLM-as-judge auto quality scoring
 │   │   └── guardrails_service.py   # PII detection, jailbreak scan, output validation
 │   ├── api/
@@ -391,14 +391,39 @@ Sidebar controls: time window (1h–7d), model filter, alert threshold sliders, 
 
 ### Alerting
 
+Four channels are supported — enable any combination by setting the relevant variable.
+
 | Variable | Default | Description |
 |---|---|---|
 | `SLACK_WEBHOOK_URL` | — | Slack Incoming Webhook URL |
 | `DISCORD_WEBHOOK_URL` | — | Discord Webhook URL |
+| `PAGERDUTY_ROUTING_KEY` | — | PagerDuty Events API v2 integration routing key (32 chars) |
+| `TEAMS_WEBHOOK_URL` | — | Microsoft Teams Incoming Webhook connector URL |
 | `ALERT_COOLDOWN_SECONDS` | `300` | Min seconds between repeated alerts of the same type |
 | `LATENCY_ALERT_THRESHOLD_MS` | `5000` | Latency threshold in ms |
 | `COST_ALERT_THRESHOLD_USD` | `0.10` | Cost threshold in USD |
 | `MODEL_ALERT_THRESHOLDS_JSON` | `{}` | Per-model overrides: `{"gpt-4o": {"latency_ms": 3000}}` |
+
+**Channel details:**
+
+| Channel | Payload format | Dedup |
+|---|---|---|
+| Slack | Block Kit message | cooldown by `alert_type` |
+| Discord | Embed | cooldown by `alert_type` |
+| PagerDuty | Events API v2 trigger | `dedup_key = alert_type` (updates open incident) |
+| Microsoft Teams | Adaptive Card (v1.4) | cooldown by `alert_type` |
+
+**PagerDuty setup:**
+1. Go to **Services → \<your service\> → Integrations → Add integration**
+2. Choose **Events API v2** and copy the 32-character routing key
+3. Set `PAGERDUTY_ROUTING_KEY=<key>` in `.env`
+
+Severity mapping: `color="danger"` → `critical`, `color="warning"` → `warning`, `color="info"` → `info`.
+
+**Teams setup:**
+1. In Teams open the channel → **… → Connectors → Incoming Webhook → Configure**
+2. Name the webhook and copy the generated URL
+3. Set `TEAMS_WEBHOOK_URL=<url>` in `.env`
 
 ### LLM-as-Judge
 
@@ -601,7 +626,7 @@ Each span includes `llm.model`, `llm.provider`, `llm.prompt_tokens`, `llm.comple
 - **Custom guardrail patterns**: Add to `_JAILBREAK_PATTERNS` or `_REGEX_PII` in [services/guardrails_service.py](llm_observability/services/guardrails_service.py).
 - **Presidio custom recognisers**: Extend `_presidio_scan_pii()` with a `PatternRecognizer` for domain entities (e.g. employee IDs, medical record numbers).
 - **NeMo custom topics**: Extend `_NEMO_PROMPTS_YAML` or `_NEMO_COLANG_CONTENT` in [services/guardrails_service.py](llm_observability/services/guardrails_service.py) to add domain-specific topic restrictions or dialogue flows. Enable with `GUARDRAILS_NEMO_ENABLED=true`.
-- **PagerDuty / Teams alerting**: Add a handler to [services/alerting_service.py](llm_observability/services/alerting_service.py).
+- **Custom alert channels**: Add a `_send_<channel>()` classmethod to [services/alerting_service.py](llm_observability/services/alerting_service.py) following the Slack/Discord/PagerDuty/Teams pattern, then call it in `send_alert()`.
 - **Custom judge prompts**: Edit `_SYSTEM_PROMPT` in [services/judge_service.py](llm_observability/services/judge_service.py).
 - **LangSmith tracing**: Replace `TracingService` with a LangSmith callback handler.
 - **Authentication**: Add `fastapi-users` or OAuth2 middleware to `main.py`.

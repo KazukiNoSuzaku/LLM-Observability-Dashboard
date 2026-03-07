@@ -99,6 +99,21 @@ class Settings(BaseSettings):
         default="",
         description="Discord Webhook URL (leave empty to disable)",
     )
+    pagerduty_routing_key: str = Field(
+        default="",
+        description=(
+            "PagerDuty Events API v2 integration routing key. "
+            "Create an 'Events API v2' integration in your PagerDuty service, "
+            "then paste the 32-character routing key here."
+        ),
+    )
+    teams_webhook_url: str = Field(
+        default="",
+        description=(
+            "Microsoft Teams Incoming Webhook URL. "
+            "Create via Teams channel → Connectors → Incoming Webhook."
+        ),
+    )
     alert_cooldown_seconds: int = Field(
         default=300,
         description="Minimum seconds between repeated alerts of the same type",
