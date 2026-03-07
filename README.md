@@ -498,6 +498,50 @@ Both tables are created automatically on startup. New columns are added via `ALT
 
 ---
 
+## Supabase / PostgreSQL Setup
+
+The system supports **SQLite** (default, zero-config) and **PostgreSQL** (production-ready, including [Supabase](https://supabase.com)).
+
+### Quick Supabase Setup
+
+1. **Create a project** at [supabase.com](https://supabase.com) (free tier available).
+
+2. **Get your connection string**: Project Settings → Database → Connection string → URI tab.
+
+3. **Set `DATABASE_URL`** in your `.env` file:
+   ```env
+   # Session pooler — recommended for serverless / short-lived connections
+   DATABASE_URL=postgresql+asyncpg://postgres.[ref]:[password]@aws-0-us-east-1.pooler.supabase.com:6543/postgres
+
+   # Direct connection — for long-lived processes (FastAPI, seed script)
+   # DATABASE_URL=postgresql+asyncpg://postgres:[password]@db.[ref].supabase.co:5432/postgres
+   ```
+
+4. **Install PostgreSQL drivers**:
+   ```bash
+   pip install asyncpg psycopg2-binary
+   ```
+
+5. **Run the app** — tables are created automatically on first startup:
+   ```bash
+   make run-api          # FastAPI (uses asyncpg)
+   make run-dashboard    # Streamlit (uses psycopg2 via SQLAlchemy sync engine)
+   ```
+
+### What Changes Between SQLite and Supabase
+
+| Component | SQLite | Supabase / PostgreSQL |
+|---|---|---|
+| Driver (async) | `aiosqlite` | `asyncpg` |
+| Driver (sync dashboard) | `sqlite3` → `sqlalchemy` | `psycopg2-binary` → `sqlalchemy` |
+| Time bucketing | `strftime` + `printf` | `date_bin` (PG 14+) |
+| Schema migrations | `ALTER TABLE … ADD COLUMN` (ignore error) | `ALTER TABLE … ADD COLUMN IF NOT EXISTS` |
+| Seed data | `make seed` | `make seed` (same script) |
+
+> **Note**: The Streamlit dashboard automatically detects the database type from `DATABASE_URL` and switches drivers — no code changes needed.
+
+---
+
 ## Arize Phoenix Tracing (Optional)
 
 Every `ObservedLLM.generate()` call emits an OpenTelemetry span when `PHOENIX_ENABLED=true`.
@@ -515,7 +559,7 @@ Each span includes `llm.model`, `llm.provider`, `llm.prompt_tokens`, `llm.comple
 ## Extending the Project
 
 - **Add a new LLM provider**: Add `_call_<provider>()` to `ObservedLLM` in [core/llm_wrapper.py](llm_observability/core/llm_wrapper.py) and extend `_detect_provider()` with the new model prefix.
-- **PostgreSQL**: Change `DATABASE_URL` to `postgresql+asyncpg://...` and `pip install asyncpg`.
+- **Supabase / PostgreSQL**: See the [Supabase Setup](#supabase--postgresql-setup) section above — change `DATABASE_URL` and `pip install asyncpg psycopg2-binary`.
 - **Custom guardrail patterns**: Add to `_JAILBREAK_PATTERNS` or `_REGEX_PII` in [services/guardrails_service.py](llm_observability/services/guardrails_service.py).
 - **Presidio custom recognisers**: Extend `_presidio_scan_pii()` with a `PatternRecognizer` for domain entities (e.g. employee IDs, medical record numbers).
 - **NeMo Guardrails**: Replace `_guardrails_validate_output()` with an `LLMRails` call for dialogue-flow and topic guardrails.

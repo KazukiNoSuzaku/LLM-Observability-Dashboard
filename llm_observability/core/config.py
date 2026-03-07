@@ -56,6 +56,21 @@ class Settings(BaseSettings):
     max_tokens: int = Field(default=1024, description="Max completion tokens")
 
     # ------------------------------------------------------------------ #
+    # Supabase (optional — only needed when DATABASE_URL points at Supabase)
+    # ------------------------------------------------------------------ #
+    supabase_url: str = Field(
+        default="",
+        description=(
+            "Supabase project URL (e.g. https://<ref>.supabase.co). "
+            "Not required when connecting via DATABASE_URL directly."
+        ),
+    )
+    supabase_anon_key: str = Field(
+        default="",
+        description="Supabase anon/public key (for the supabase-py client, optional).",
+    )
+
+    # ------------------------------------------------------------------ #
     # FastAPI server
     # ------------------------------------------------------------------ #
     api_host: str = Field(default="0.0.0.0")

@@ -57,12 +57,18 @@ async def init_db() -> None:
         await _migrate_columns(conn)
 
 
+def _is_postgres() -> bool:
+    """Return True when the configured DATABASE_URL targets PostgreSQL."""
+    return settings.database_url.startswith("postgresql")
+
+
 async def _migrate_columns(conn) -> None:  # type: ignore[no-untyped-def]
     """Add new columns to existing tables without dropping data.
 
-    Each ALTER TABLE statement is attempted individually; if the column
-    already exists SQLite raises an OperationalError which we suppress.
-    This lets us evolve the schema incrementally without a migration tool.
+    On SQLite each ALTER TABLE is attempted individually and OperationalError
+    (column already exists) is silently suppressed.
+    On PostgreSQL we use ``ADD COLUMN IF NOT EXISTS`` which is a no-op when
+    the column is already present.
     """
     new_columns = [
         # table, column, sql_type
@@ -82,15 +88,30 @@ async def _migrate_columns(conn) -> None:  # type: ignore[no-untyped-def]
         ("guardrail_logs", "snippet",        "TEXT"),
         ("guardrail_logs", "metadata_json",  "TEXT"),
     ]
+    postgres = _is_postgres()
     for table, column, col_type in new_columns:
-        try:
-            await conn.execute(
-                text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-            )
-            logger.info("Migration: added column %s.%s", table, column)
-        except Exception:
-            # Column already exists — this is expected on subsequent startups
-            pass
+        if postgres:
+            # PostgreSQL supports IF NOT EXISTS — single idempotent statement
+            try:
+                await conn.execute(
+                    text(
+                        f"ALTER TABLE {table} "
+                        f"ADD COLUMN IF NOT EXISTS {column} {col_type}"
+                    )
+                )
+                logger.debug("Migration: ensured column %s.%s", table, column)
+            except Exception as exc:
+                logger.warning("Migration error %s.%s: %s", table, column, exc)
+        else:
+            # SQLite: attempt and ignore "duplicate column" error
+            try:
+                await conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                )
+                logger.info("Migration: added column %s.%s", table, column)
+            except Exception:
+                # Column already exists — expected on subsequent startups
+                pass
 
 
 async def get_db() -> AsyncSession:  # type: ignore[return]

@@ -33,6 +33,10 @@ numpy>=1.26.0
 # HTTP client
 httpx>=0.25.0
 
+# PostgreSQL / Supabase (async + sync drivers — only needed when DATABASE_URL is postgresql+asyncpg://...)
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.0
+
 # Form data parsing (FastAPI)
 python-multipart>=0.0.6
 

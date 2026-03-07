@@ -6,40 +6,44 @@ from typing import Any, Dict, List
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from llm_observability.core.config import settings
 
-class MetricsService:
-    """Provides pre-aggregated, time-bucketed metrics for charting."""
 
-    @staticmethod
-    async def get_timeseries(
-        db: AsyncSession,
-        *,
-        hours: int = 24,
-        bucket_minutes: int = 5,
-    ) -> List[Dict[str, Any]]:
-        """Return per-bucket aggregates suitable for time-series charts.
+def _is_postgres() -> bool:
+    return settings.database_url.startswith("postgresql")
 
-        Uses SQLite's ``strftime`` to bucket rows into fixed-width windows.
-        Each bucket contains:
-          - timestamp        : ISO-8601 bucket start
-          - request_count    : number of requests in the bucket
-          - avg_latency_ms   : mean latency for successful requests
-          - total_cost       : sum of estimated_cost
-          - total_tokens     : sum of total_tokens
-          - error_count      : number of error requests
 
-        Args:
-            db:             Async SQLAlchemy session.
-            hours:          How many hours back to look.
-            bucket_minutes: Width of each time bucket in minutes.
+def _timeseries_sql(bucket_minutes: int) -> str:
+    """Return a DB-appropriate SELECT for time-bucketed aggregation.
+
+    SQLite uses ``strftime`` + ``printf`` integer-division bucketing.
+    PostgreSQL uses ``date_trunc`` + ``date_bin`` (PG 14+) or the equivalent
+    ``floor(extract(epoch…) / interval)`` approach for older versions.
+    We use the ``date_bin`` path (available in PostgreSQL >= 14, which covers
+    all Supabase-hosted projects) and fall back to the ``floor/epoch`` trick.
+    """
+    if _is_postgres():
+        interval = f"{bucket_minutes} minutes"
+        return f"""
+            SELECT
+                date_bin(
+                    '{interval}'::interval,
+                    timestamp AT TIME ZONE 'UTC',
+                    TIMESTAMP '2000-01-01 00:00:00'
+                ) AS bucket,
+                COUNT(*)                                               AS request_count,
+                AVG(CASE WHEN is_error = false THEN latency_ms END)   AS avg_latency_ms,
+                SUM(COALESCE(estimated_cost, 0))                       AS total_cost,
+                SUM(COALESCE(total_tokens, 0))                         AS total_tokens,
+                SUM(CASE WHEN is_error = true THEN 1 ELSE 0 END)      AS error_count
+            FROM llm_requests
+            WHERE timestamp >= :since
+            GROUP BY bucket
+            ORDER BY bucket
         """
-        since = datetime.now(timezone.utc) - timedelta(hours=hours)
-
-        # SQLite-compatible time bucketing:
-        # strftime truncates to the minute, then we zero out the sub-bucket
-        # remainder by integer division.
-        sql = text(
-            f"""
+    else:
+        # SQLite-compatible bucketing
+        return f"""
             SELECT
                 strftime('%Y-%m-%dT%H:', timestamp)
                 || printf('%02d', (CAST(strftime('%M', timestamp) AS INTEGER)
@@ -54,15 +58,38 @@ class MetricsService:
             WHERE timestamp >= :since
             GROUP BY bucket
             ORDER BY bucket
-            """
-        )
+        """
 
+
+class MetricsService:
+    """Provides pre-aggregated, time-bucketed metrics for charting."""
+
+    @staticmethod
+    async def get_timeseries(
+        db: AsyncSession,
+        *,
+        hours: int = 24,
+        bucket_minutes: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Return per-bucket aggregates suitable for time-series charts.
+
+        Works with both SQLite (default, local) and PostgreSQL / Supabase.
+        Each bucket contains:
+          - timestamp        : ISO-8601 bucket start
+          - request_count    : number of requests in the bucket
+          - avg_latency_ms   : mean latency for successful requests
+          - total_cost       : sum of estimated_cost
+          - total_tokens     : sum of total_tokens
+          - error_count      : number of error requests
+        """
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        sql = text(_timeseries_sql(bucket_minutes))
         result = await db.execute(sql, {"since": since.isoformat()})
         rows = result.fetchall()
 
         return [
             {
-                "timestamp": row[0],
+                "timestamp": str(row[0]),
                 "request_count": int(row[1]),
                 "avg_latency_ms": round(float(row[2] or 0), 2),
                 "total_cost": round(float(row[3] or 0), 8),

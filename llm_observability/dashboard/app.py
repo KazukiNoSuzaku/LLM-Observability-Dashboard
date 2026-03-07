@@ -1,6 +1,8 @@
 """Streamlit LLM Observability Dashboard — premium dark analytics UI.
 
-Reads directly from the SQLite database (no FastAPI dependency required).
+Reads directly from the database (SQLite by default, or PostgreSQL / Supabase
+when DATABASE_URL is set to a postgresql+asyncpg:// URL). No FastAPI dependency
+required — the dashboard uses a synchronous SQLAlchemy engine.
 
 Run:
     streamlit run llm_observability/dashboard/app.py
@@ -8,8 +10,8 @@ Run:
 
 import io
 import os
-import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -17,14 +19,77 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sqlalchemy import create_engine, text as sa_text
 
 # ---------------------------------------------------------------------------
-# Path resolution
+# Database engine — works with SQLite (default) and PostgreSQL / Supabase
 # ---------------------------------------------------------------------------
 _DASHBOARD_DIR = os.path.dirname(os.path.abspath(__file__))
 _PACKAGE_DIR   = os.path.dirname(_DASHBOARD_DIR)
 _PROJECT_ROOT  = os.path.dirname(_PACKAGE_DIR)
-DB_PATH = os.path.join(_PROJECT_ROOT, "llm_observability.db")
+
+
+def _make_sync_url(async_url: str) -> str:
+    """Convert an async DATABASE_URL to a synchronous driver URL."""
+    url = async_url
+    url = url.replace("sqlite+aiosqlite", "sqlite")
+    url = url.replace("postgresql+asyncpg", "postgresql+psycopg2")
+    return url
+
+
+_RAW_DB_URL = os.getenv(
+    "DATABASE_URL", "sqlite+aiosqlite:///./llm_observability.db"
+)
+_SYNC_URL = _make_sync_url(_RAW_DB_URL)
+
+# For SQLite with a relative path, resolve it against the project root
+if _SYNC_URL.startswith("sqlite:///./"):
+    _rel = _SYNC_URL[len("sqlite:///./"):]
+    _SYNC_URL = "sqlite:///" + os.path.join(_PROJECT_ROOT, _rel).replace("\\", "/")
+
+_IS_POSTGRES = _SYNC_URL.startswith("postgresql")
+
+# Label shown in the footer (filename for SQLite, host for Postgres)
+if _IS_POSTGRES:
+    # Extract host from URL for display
+    _DB_LABEL = _SYNC_URL.split("@")[-1].split("/")[0] if "@" in _SYNC_URL else "postgres"
+else:
+    _DB_LABEL = os.path.basename(_SYNC_URL.split("///")[-1])
+
+# DB_PATH kept for backwards-compat references in the rest of the file
+DB_PATH = _SYNC_URL.split("///")[-1] if not _IS_POSTGRES else ""
+
+try:
+    _sync_engine = create_engine(
+        _SYNC_URL,
+        pool_pre_ping=True,
+        connect_args={} if _IS_POSTGRES else {"check_same_thread": False},
+    )
+except Exception:
+    _sync_engine = None  # type: ignore[assignment]
+
+
+@contextmanager
+def _db_conn():
+    """Yield a synchronous SQLAlchemy connection, or raise RuntimeError."""
+    if _sync_engine is None:
+        raise RuntimeError("No database engine available")
+    with _sync_engine.connect() as conn:
+        yield conn
+
+
+def _db_available() -> bool:
+    """Return True if the database can be reached."""
+    if _sync_engine is None:
+        return False
+    if not _IS_POSTGRES and not os.path.exists(DB_PATH):
+        return False
+    try:
+        with _sync_engine.connect() as conn:
+            conn.execute(sa_text("SELECT 1"))
+        return True
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -571,46 +636,51 @@ def _layout(h: int = CHART_H, **kw) -> dict:
 
 @st.cache_data(ttl=10, show_spinner=False)
 def load_guardrail_logs(hours: int) -> pd.DataFrame:
-    """Load guardrail violation events from the DB (direct SQLite read)."""
-    if not os.path.exists(DB_PATH):
+    """Load guardrail violation events from the DB."""
+    if not _db_available():
         return pd.DataFrame()
     since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
-    conn = sqlite3.connect(DB_PATH)
     try:
-        df = pd.read_sql_query(
-            """
-            SELECT id, request_id, timestamp, stage, violation_type,
-                   severity, action_taken, latency_ms, snippet
-            FROM guardrail_logs
-            WHERE timestamp >= ?
-            ORDER BY timestamp DESC
-            """,
-            conn,
-            params=[since],
-        )
+        with _db_conn() as conn:
+            df = pd.read_sql(
+                sa_text(
+                    """
+                    SELECT id, request_id, timestamp, stage, violation_type,
+                           severity, action_taken, latency_ms, snippet
+                    FROM guardrail_logs
+                    WHERE timestamp >= :since
+                    ORDER BY timestamp DESC
+                    """
+                ),
+                conn,
+                params={"since": since},
+            )
         if not df.empty:
             df["timestamp"] = pd.to_datetime(df["timestamp"])
         return df
     except Exception:
         return pd.DataFrame()
-    finally:
-        conn.close()
 
 
 @st.cache_data(ttl=10, show_spinner=False)
 def load_data(hours: int, model_filter: str) -> pd.DataFrame:
-    if not os.path.exists(DB_PATH):
+    if not _db_available():
         return pd.DataFrame()
     since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
-    mc = "AND model_name = ?" if model_filter != "All" else ""
-    params: list = [since] + ([model_filter] if model_filter != "All" else [])
-    conn = sqlite3.connect(DB_PATH)
-    # Ensure provider column exists (incremental migration for dashboard-only users)
-    try:
-        conn.execute("ALTER TABLE llm_requests ADD COLUMN provider TEXT")
-        conn.commit()
-    except Exception:
-        pass
+    model_clause = "AND model_name = :model" if model_filter != "All" else ""
+    params: dict = {"since": since}
+    if model_filter != "All":
+        params["model"] = model_filter
+
+    # Ensure provider column exists (SQLite only — PostgreSQL uses IF NOT EXISTS in init_db)
+    if not _IS_POSTGRES:
+        try:
+            with _sync_engine.connect() as _c:
+                _c.execute(sa_text("ALTER TABLE llm_requests ADD COLUMN provider TEXT"))
+                _c.commit()
+        except Exception:
+            pass
+
     q = f"""
         SELECT id, timestamp, model_name,
                COALESCE(provider, 'anthropic') AS provider,
@@ -620,11 +690,14 @@ def load_data(hours: int, model_filter: str) -> pd.DataFrame:
                SUBSTR(prompt,   1, 120) AS prompt_preview,
                SUBSTR(response, 1, 200) AS response_preview
         FROM llm_requests
-        WHERE timestamp >= ? {mc}
+        WHERE timestamp >= :since {model_clause}
         ORDER BY timestamp DESC
     """
-    df = pd.read_sql_query(q, conn, params=params)
-    conn.close()
+    try:
+        with _db_conn() as conn:
+            df = pd.read_sql(sa_text(q), conn, params=params)
+    except Exception:
+        return pd.DataFrame()
     if not df.empty:
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         df["is_error"]  = df["is_error"].astype(bool)
@@ -633,83 +706,83 @@ def load_data(hours: int, model_filter: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def get_available_models() -> list:
-    if not os.path.exists(DB_PATH):
+    if not _db_available():
         return ["All"]
-    conn = sqlite3.connect(DB_PATH)
     try:
-        df = pd.read_sql_query(
-            "SELECT DISTINCT model_name FROM llm_requests ORDER BY model_name", conn
-        )
+        with _db_conn() as conn:
+            df = pd.read_sql(
+                sa_text("SELECT DISTINCT model_name FROM llm_requests ORDER BY model_name"),
+                conn,
+            )
         return ["All"] + df["model_name"].tolist()
     except Exception:
         return ["All"]
-    finally:
-        conn.close()
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def get_template_names() -> list:
-    if not os.path.exists(DB_PATH):
+    if not _db_available():
         return []
-    conn = sqlite3.connect(DB_PATH)
     try:
-        df = pd.read_sql_query(
-            "SELECT DISTINCT name FROM prompt_templates WHERE is_active=1 ORDER BY name", conn
-        )
+        with _db_conn() as conn:
+            df = pd.read_sql(
+                sa_text("SELECT DISTINCT name FROM prompt_templates WHERE is_active=1 ORDER BY name"),
+                conn,
+            )
         return df["name"].tolist()
     except Exception:
         return []
-    finally:
-        conn.close()
 
 
 @st.cache_data(ttl=10, show_spinner=False)
 def load_version_metrics(template_name: str, hours: int) -> pd.DataFrame:
-    if not os.path.exists(DB_PATH):
+    if not _db_available():
         return pd.DataFrame()
     since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
-    conn = sqlite3.connect(DB_PATH)
     try:
-        return pd.read_sql_query(
-            """
-            SELECT
-                prompt_template_version                                AS version,
-                COUNT(*)                                               AS request_count,
-                AVG(CASE WHEN is_error=0 THEN latency_ms END)         AS avg_latency_ms,
-                SUM(COALESCE(estimated_cost,0))                        AS total_cost,
-                AVG(COALESCE(estimated_cost,0))                        AS avg_cost,
-                AVG(feedback_score)                                    AS avg_feedback,
-                SUM(CASE WHEN is_error=1 THEN 1 ELSE 0 END)           AS errors,
-                SUM(COALESCE(total_tokens,0))                          AS total_tokens
-            FROM llm_requests
-            WHERE prompt_template_name=? AND timestamp>=?
-              AND prompt_template_version IS NOT NULL
-            GROUP BY prompt_template_version
-            ORDER BY prompt_template_version
-            """,
-            conn, params=[template_name, since],
-        )
+        with _db_conn() as conn:
+            return pd.read_sql(
+                sa_text(
+                    """
+                    SELECT
+                        prompt_template_version                                AS version,
+                        COUNT(*)                                               AS request_count,
+                        AVG(CASE WHEN is_error=0 THEN latency_ms END)         AS avg_latency_ms,
+                        SUM(COALESCE(estimated_cost,0))                        AS total_cost,
+                        AVG(COALESCE(estimated_cost,0))                        AS avg_cost,
+                        AVG(feedback_score)                                    AS avg_feedback,
+                        SUM(CASE WHEN is_error=1 THEN 1 ELSE 0 END)           AS errors,
+                        SUM(COALESCE(total_tokens,0))                          AS total_tokens
+                    FROM llm_requests
+                    WHERE prompt_template_name=:name AND timestamp>=:since
+                      AND prompt_template_version IS NOT NULL
+                    GROUP BY prompt_template_version
+                    ORDER BY prompt_template_version
+                    """
+                ),
+                conn,
+                params={"name": template_name, "since": since},
+            )
     except Exception:
         return pd.DataFrame()
-    finally:
-        conn.close()
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_template_definitions(template_name: str) -> pd.DataFrame:
-    if not os.path.exists(DB_PATH):
+    if not _db_available():
         return pd.DataFrame()
-    conn = sqlite3.connect(DB_PATH)
     try:
-        return pd.read_sql_query(
-            """SELECT version, content, system_prompt, description, created_at, is_active
-               FROM prompt_templates WHERE name=? ORDER BY version""",
-            conn, params=[template_name],
-        )
+        with _db_conn() as conn:
+            return pd.read_sql(
+                sa_text(
+                    """SELECT version, content, system_prompt, description, created_at, is_active
+                       FROM prompt_templates WHERE name=:name ORDER BY version"""
+                ),
+                conn,
+                params={"name": template_name},
+            )
     except Exception:
         return pd.DataFrame()
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -834,7 +907,7 @@ with st.sidebar:
 
     st.markdown(
         f"<div style='font-size:0.65rem;color:#475569;margin-top:14px'>"
-        f"<code style='color:#64748b;font-size:0.60rem'>{os.path.basename(DB_PATH)}</code>"
+        f"<code style='color:#64748b;font-size:0.60rem'>{_DB_LABEL}</code>"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -859,7 +932,7 @@ st.markdown(
       </div>
       <div class="pills">
         <div class="pill"><span class="live"></span>&thinsp;Live</div>
-        <div class="pill">{os.path.basename(DB_PATH)}</div>
+        <div class="pill">{_DB_LABEL}</div>
       </div>
     </div>
     """,
@@ -2017,7 +2090,7 @@ with fc1:
         f"<div style='font-size:0.68rem;color:#475569'>"
         f"Requests shown: <strong style='color:#94a3b8'>{len(df):,}</strong>"
         f" &nbsp;·&nbsp; Total cost: <strong style='color:#94a3b8'>${total_cost:.4f}</strong>"
-        f" &nbsp;·&nbsp; <code style='font-size:0.62rem'>{DB_PATH}</code></div>",
+        f" &nbsp;·&nbsp; <code style='font-size:0.62rem'>{_DB_LABEL}</code></div>",
         unsafe_allow_html=True,
     )
 with fc2:
