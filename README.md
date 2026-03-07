@@ -1,8 +1,8 @@
 # LLM Observability Dashboard
 
-> Production-grade monitoring, safety, and analytics for LLM applications — built with FastAPI, Streamlit, and SQLite.
+> Production-grade monitoring, safety, and analytics for LLM applications — built with FastAPI, Streamlit, and SQLite / PostgreSQL (Supabase).
 
-Track every LLM request across **four providers** (Anthropic, OpenAI, Google Gemini, Mistral AI), surface real-time latency/cost/quality metrics, detect anomalies, run A/B prompt tests, and enforce active input/output safety guardrails — all in one self-hosted stack.
+Track every LLM request across **four providers** (Anthropic, OpenAI, Google Gemini, Mistral AI), surface real-time latency/cost/quality metrics, detect anomalies, run A/B prompt tests, and enforce four-layer input/output safety guardrails — all in one self-hosted stack.
 
 ---
 
@@ -12,13 +12,13 @@ Track every LLM request across **four providers** (Anthropic, OpenAI, Google Gem
 |---|---|
 | **Multi-provider routing** | Auto-detect provider from model name — Claude, GPT, Gemini, Mistral — zero config changes |
 | **Full request tracing** | Latency, token usage, cost, error tracking, and OTel spans on every call |
-| **Safety & Guardrails** | PII detection (Presidio), jailbreak blocking (10 patterns), output validation (Guardrails AI) |
+| **Safety & Guardrails** | 4-layer middleware: PII detection (Presidio), jailbreak blocking, Guardrails AI schema checks, NeMo dialogue-flow rails |
 | **LLM-as-Judge scoring** | Auto-score responses 0–1 via a cheap judge model after every generation |
 | **Anomaly detection** | Z-score flagging of latency and cost spikes with per-bucket analysis |
 | **Cost forecasting** | Linear regression on cumulative cost trend with a forward projection |
 | **A/B prompt testing** | Run two template versions in parallel and get a head-to-head verdict |
 | **Webhook alerting** | Slack, Discord, PagerDuty, and Microsoft Teams alerts with per-model thresholds and cooldown dedup |
-| **Real-time dashboard** | 10-section Streamlit UI reading SQLite directly — no API server required |
+| **Real-time dashboard** | 10-section Streamlit UI — reads SQLite or PostgreSQL directly, no API server required |
 
 ---
 
@@ -39,12 +39,13 @@ Track every LLM request across **four providers** (Anthropic, OpenAI, Google Gem
 ┌──────────────────────┐       ┌───────────────────────────────┐
 │   FastAPI  :8000     │       │   Streamlit Dashboard  :8501   │
 └──────────┬───────────┘       └──────────┬────────────────────┘
-           │                              │ direct SQLite read
+           │                              │ SQLAlchemy sync engine
            ▼                              │
 ┌──────────────────────────────────┐      │
 │   GuardrailsService  [INPUT]     │      │
 │   · Presidio PII scan / regex    │      │
-│   · Jailbreak pattern matching   │      │
+│   · Jailbreak regex (10 patterns) │      │
+│   · NeMo self_check_input [opt]  │      │
 │   · Block / Redact / Log         │      │
 └──────────┬───────────────────────┘      │
            │                              │
@@ -56,7 +57,7 @@ Track every LLM request across **four providers** (Anthropic, OpenAI, Google Gem
 │   · Extract token usage & cost   │      │
 │   · LLM-as-Judge auto-scoring    │      │
 │   · Emit OpenTelemetry spans     │      │
-│   · Fire Slack/Discord alerts    │      │
+│   · Fire webhook alerts          │      │
 └──────────┬───────────────────────┘      │
            │                              │
            ▼  [routes to one of:]         │
@@ -68,8 +69,9 @@ Track every LLM request across **four providers** (Anthropic, OpenAI, Google Gem
            ▼
 ┌──────────────────────────────────┐
 │   GuardrailsService  [OUTPUT]    │
-│   · Presidio PII redaction       │
+│   · NeMo self_check_output [opt] │
 │   · Guardrails AI schema check   │
+│   · Presidio PII redaction       │
 │   · Log violations to DB         │
 └──────────┬───────────────────────┘
            │
@@ -85,15 +87,16 @@ Track every LLM request across **four providers** (Anthropic, OpenAI, Google Gem
            ▼
 ┌──────────────────────────────────┐
 │  AlertingService                 │
-│  · Slack + Discord webhooks      │
-│  · Per-model cooldown dedup      │
+│  · Slack  · Discord              │
+│  · PagerDuty  · Teams            │
+│  · Per-type cooldown dedup       │
 └──────────────────────────────────┘
 ```
 
 **Design decisions**
 - The Streamlit dashboard reads SQLite **directly** — no FastAPI dependency for viewing data.
 - All four providers write to the same `llm_requests` table with a `provider` column.
-- Guardrails are enabled by default and degrade gracefully — Presidio and Guardrails AI are optional installs; the service falls back to compiled regex and length checks if they're absent.
+- Guardrails are enabled by default and degrade gracefully — Presidio, Guardrails AI, and NeMo are optional installs; the service falls back to compiled regex and length checks if they're absent.
 - Schema migrations are applied automatically on startup — no migration tool needed.
 
 ---
@@ -384,8 +387,11 @@ Sidebar controls: time window (1h–7d), model filter, alert threshold sliders, 
 |---|---|---|
 | `ANTHROPIC_API_KEY` | — | Anthropic API key |
 | `OPENAI_API_KEY` | — | OpenAI API key |
+| `GOOGLE_API_KEY` | — | Google Gemini API key |
 | `MISTRAL_API_KEY` | — | Mistral AI API key |
-| `DATABASE_URL` | `sqlite+aiosqlite:///./llm_observability.db` | SQLAlchemy async DB URL |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./llm_observability.db` | SQLAlchemy async DB URL (SQLite or `postgresql+asyncpg://...`) |
+| `SUPABASE_URL` | — | Supabase project URL (optional — only needed for the `supabase-py` client) |
+| `SUPABASE_ANON_KEY` | — | Supabase anon key (optional — SQLAlchemy uses `DATABASE_URL` directly) |
 | `DEFAULT_MODEL` | `claude-haiku-4-5-20251001` | Default model |
 | `MAX_TOKENS` | `1024` | Max completion tokens |
 
@@ -437,10 +443,13 @@ Severity mapping: `color="danger"` → `critical`, `color="warning"` → `warnin
 | Variable | Default | Description |
 |---|---|---|
 | `GUARDRAILS_ENABLED` | `true` | Master on/off switch |
-| `GUARDRAILS_BLOCK_ON_PII` | `false` | Block requests with PII (false = redact instead) |
+| `GUARDRAILS_BLOCK_ON_PII` | `false` | Block requests with PII (`false` = redact instead) |
 | `GUARDRAILS_BLOCK_ON_JAILBREAK` | `true` | Hard-block jailbreak attempts |
 | `GUARDRAILS_REDACT_OUTPUT_PII` | `true` | Replace PII in responses with `[REDACTED:TYPE]` |
-| `GUARDRAILS_USE_PRESIDIO` | `true` | Use Presidio (falls back to regex if not installed) |
+| `GUARDRAILS_USE_PRESIDIO` | `true` | Use Presidio NER (falls back to regex if not installed) |
+| `GUARDRAILS_NEMO_ENABLED` | `false` | Enable NeMo Guardrails LLMRails (Layer 4) |
+| `GUARDRAILS_NEMO_ENGINE` | `auto` | NeMo LLM engine: `auto` \| `openai` \| `anthropic` |
+| `GUARDRAILS_NEMO_MODEL` | `gpt-4o-mini` | Model for NeMo secondary validation calls |
 
 ### Tracing
 
@@ -536,7 +545,7 @@ CREATE TABLE guardrail_logs (
     request_id       INTEGER  REFERENCES llm_requests(id) ON DELETE SET NULL,
     timestamp        DATETIME NOT NULL,
     stage            VARCHAR(20) NOT NULL,    -- input | output
-    violation_type   VARCHAR(50) NOT NULL,    -- pii | jailbreak | output_invalid
+    violation_type   VARCHAR(50) NOT NULL,    -- pii | jailbreak | output_invalid | nemo
     severity         VARCHAR(20) NOT NULL,    -- low | medium | high | critical
     action_taken     VARCHAR(20) NOT NULL,    -- pass | block | redact | log
     latency_ms       FLOAT,
