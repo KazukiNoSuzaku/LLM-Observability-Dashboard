@@ -460,6 +460,49 @@ Severity mapping: `color="danger"` → `critical`, `color="warning"` → `warnin
 
 ---
 
+## Authentication
+
+Auth is **disabled by default** — every request is accepted as `anonymous`. Set `AUTH_ENABLED=true` to require credentials.
+
+### Two mechanisms (use either or both)
+
+| Mechanism | How to use | Set up |
+|---|---|---|
+| Bearer token (JWT) | `POST /auth/token` → get token → `Authorization: Bearer <token>` | `AUTH_USERNAME`, `AUTH_PASSWORD` |
+| API Key (static) | `X-API-Key: <key>` header on every request | `AUTH_API_KEY` |
+
+### Quick start
+
+```bash
+# 1. Enable auth in .env
+AUTH_ENABLED=true
+AUTH_PASSWORD=changeme
+AUTH_API_KEY=my-static-key       # optional
+
+# 2a. Bearer token flow
+TOKEN=$(curl -sX POST http://localhost:8000/auth/token \
+  -d "username=admin&password=changeme" \
+  -H "Content-Type: application/x-www-form-urlencoded" | jq -r .access_token)
+
+curl http://localhost:8000/api/v1/metrics/summary \
+  -H "Authorization: Bearer $TOKEN"
+
+# 2b. API key flow
+curl http://localhost:8000/api/v1/metrics/summary \
+  -H "X-API-Key: my-static-key"
+```
+
+### Auth endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/auth/token` | Exchange username + password for a JWT (OAuth2 Password Flow) |
+| `GET` | `/auth/me` | Returns caller identity (`username`, `auth_method`, `authenticated`) |
+
+> **Production note**: Set `AUTH_SECRET_KEY` to a random 32-char secret so JWTs survive server restarts. Install `PyJWT>=2.8.0` for standard JWT encoding (the module falls back to an HMAC-signed token otherwise).
+
+---
+
 ## API Reference
 
 All endpoints prefixed with `/api/v1`. Interactive docs at **http://localhost:8000/docs**.

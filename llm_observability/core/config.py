@@ -200,6 +200,44 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ------------------------------------------------------------------ #
+    # Authentication
+    # ------------------------------------------------------------------ #
+    auth_enabled: bool = Field(
+        default=False,
+        description=(
+            "Master auth switch. When False every request is accepted as 'anonymous'. "
+            "Set to True and configure AUTH_PASSWORD (and optionally AUTH_API_KEY) "
+            "to require credentials."
+        ),
+    )
+    auth_username: str = Field(
+        default="admin",
+        description="Username for the /auth/token endpoint.",
+    )
+    auth_password: str = Field(
+        default="",
+        description="Password for the /auth/token endpoint (required when AUTH_ENABLED=true).",
+    )
+    auth_api_key: str = Field(
+        default="",
+        description=(
+            "Static API key for X-API-Key header auth (optional alternative to Bearer). "
+            "Leave empty to disable API key auth."
+        ),
+    )
+    auth_secret_key: str = Field(
+        default="",
+        description=(
+            "JWT signing secret. Auto-derived from AUTH_PASSWORD when empty — "
+            "set explicitly in production so tokens survive server restarts."
+        ),
+    )
+    auth_token_expire_minutes: int = Field(
+        default=60,
+        description="JWT access token lifetime in minutes.",
+    )
+
 
 # Module-level singleton — import from here everywhere
 settings = Settings()

@@ -40,6 +40,9 @@ psycopg2-binary>=2.9.0
 # Form data parsing (FastAPI)
 python-multipart>=0.0.6
 
+# Authentication (JWT — optional; falls back to HMAC tokens if not installed)
+PyJWT>=2.8.0
+
 # Guardrails — PII detection & redaction (Microsoft Presidio)
 # Install separately — requires spaCy English model:
 #   pip install presidio-analyzer presidio-anonymizer

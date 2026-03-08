@@ -8,10 +8,12 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from llm_observability.api.auth import get_current_user
+from llm_observability.api.auth import router as auth_router
 from llm_observability.api.routes import router
 from llm_observability.core.config import settings
 from llm_observability.db.database import init_db
@@ -88,8 +90,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount all API routes under /api/v1
-app.include_router(router, prefix="/api/v1", tags=["observability"])
+# Auth endpoints (/auth/token, /auth/me) — no auth required on these
+app.include_router(auth_router)
+
+# Mount all API routes under /api/v1, protected by auth dependency
+app.include_router(
+    router,
+    prefix="/api/v1",
+    tags=["observability"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 # ---------------------------------------------------------------------------
