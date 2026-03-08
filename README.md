@@ -4,6 +4,8 @@
 
 Track every LLM request across **four providers** (Anthropic, OpenAI, Google Gemini, Mistral AI), surface real-time latency/cost/quality metrics, detect anomalies, run A/B prompt tests, and enforce four-layer input/output safety guardrails — all in one self-hosted stack.
 
+**[→ Quick Start Guide](QUICKSTART.md)** — get up and running in 5 minutes.
+
 ---
 
 ## What's Inside
