@@ -233,6 +233,60 @@ class LLMRequest(Base):
         )
 
 
+class OAuthUser(Base):
+    """Social-login user auto-provisioned on first OAuth2 callback.
+
+    One row per (provider, provider_user_id) pair — a user who signs in with
+    both Google and GitHub will have two rows.  The ``email`` column is kept
+    for display; uniqueness is enforced on the provider + provider_user_id
+    composite, not on email alone.
+    """
+
+    __tablename__ = "oauth_users"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "provider_user_id", name="uq_oauth_provider_user"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Provider identity
+    provider = Column(
+        String(20),
+        nullable=False,
+        index=True,
+        comment="'google' | 'github'",
+    )
+    provider_user_id = Column(
+        String(100),
+        nullable=False,
+        comment="Stable numeric/opaque ID from the provider (sub / user.id)",
+    )
+
+    # Profile
+    email = Column(String(255), nullable=False, index=True)
+    username = Column(
+        String(100),
+        nullable=False,
+        comment="Display name derived from profile (name / login)",
+    )
+
+    # Lifecycle
+    created_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    last_login = Column(DateTime, nullable=True)
+
+    def __repr__(self) -> str:
+        return (
+            f"<OAuthUser provider={self.provider!r} "
+            f"username={self.username!r} email={self.email!r}>"
+        )
+
+
 class GuardrailLog(Base):
     """One row per guardrail violation event.
 

@@ -11,9 +11,11 @@ from typing import AsyncIterator
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.sessions import SessionMiddleware
 
 from llm_observability.api.auth import get_current_user
 from llm_observability.api.auth import router as auth_router
+from llm_observability.api.oauth import router as oauth_router
 from llm_observability.api.routes import router
 from llm_observability.core.config import settings
 from llm_observability.db.database import init_db
@@ -81,6 +83,10 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# SessionMiddleware must be added BEFORE OAuth routes — Authlib uses the
+# session to store the OAuth2 state parameter for CSRF protection.
+app.add_middleware(SessionMiddleware, secret_key=settings.oauth_session_secret)
+
 # Allow all origins in development; restrict in production
 app.add_middleware(
     CORSMiddleware,
@@ -92,6 +98,9 @@ app.add_middleware(
 
 # Auth endpoints (/auth/token, /auth/me) — no auth required on these
 app.include_router(auth_router)
+
+# OAuth2 social login (/auth/google/login|callback, /auth/github/login|callback)
+app.include_router(oauth_router)
 
 # Mount all API routes under /api/v1, protected by auth dependency
 app.include_router(

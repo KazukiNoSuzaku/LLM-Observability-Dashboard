@@ -501,6 +501,39 @@ curl http://localhost:8000/api/v1/metrics/summary \
 
 > **Production note**: Set `AUTH_SECRET_KEY` to a random 32-char secret so JWTs survive server restarts. Install `PyJWT>=2.8.0` for standard JWT encoding (the module falls back to an HMAC-signed token otherwise).
 
+### Social login (Google + GitHub)
+
+OAuth2 social login is built on [Authlib](https://docs.authlib.org). Users are auto-provisioned in the `oauth_users` table on first login and receive the same JWT used by all other auth methods.
+
+| Provider | Login URL | Callback URL |
+|---|---|---|
+| Google | `GET /auth/google/login` | `GET /auth/google/callback` |
+| GitHub | `GET /auth/github/login` | `GET /auth/github/callback` |
+| (meta) | `GET /auth/providers` | Lists which providers are configured |
+
+**Google setup**
+1. [Google Cloud Console](https://console.cloud.google.com/apis/credentials) → Create OAuth 2.0 Client ID (Web application)
+2. Add Authorised redirect URI: `{OAUTH_REDIRECT_BASE_URL}/auth/google/callback`
+3. Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `.env`
+
+**GitHub setup**
+1. [GitHub → Settings → Developer settings → OAuth Apps](https://github.com/settings/developers) → New OAuth App
+2. Set Callback URL: `{OAUTH_REDIRECT_BASE_URL}/auth/github/callback`
+3. Set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` in `.env`
+
+```bash
+# Point a browser at the login URL — you'll be redirected to the provider,
+# then back to /callback which returns {"access_token": "...", "token_type": "bearer"}
+curl http://localhost:8000/auth/google/login        # → 302 to Google
+curl http://localhost:8000/auth/providers           # → {"google": true, "github": false}
+
+# Use the returned token exactly like a password-flow token
+curl http://localhost:8000/api/v1/metrics/summary \
+  -H "Authorization: Bearer <token_from_callback>"
+```
+
+> `OAUTH_SESSION_SECRET` must be set to a random 32-char value in production — it signs the CSRF state cookie used during the OAuth handshake.
+
 ---
 
 ## API Reference
@@ -681,4 +714,6 @@ Each span includes `llm.model`, `llm.provider`, `llm.prompt_tokens`, `llm.comple
 - **Custom alert channels**: Add a `_send_<channel>()` classmethod to [services/alerting_service.py](llm_observability/services/alerting_service.py) following the Slack/Discord/PagerDuty/Teams pattern, then call it in `send_alert()`.
 - **Custom judge prompts**: Edit `_SYSTEM_PROMPT` in [services/judge_service.py](llm_observability/services/judge_service.py).
 - **LangSmith tracing**: Replace `TracingService` with a LangSmith callback handler.
-- **Authentication**: Add `fastapi-users` or OAuth2 middleware to `main.py`.
+- **Multi-user auth with roles**: Swap the single-user config for `fastapi-users` with a `users` table; add `admin`/`viewer` role enforcement per endpoint.
+- **Rate limiting**: Add `slowapi` middleware on `/api/v1/generate` (per-IP or per-authenticated-user).
+- **Docker + CI**: Containerise API + Streamlit + Phoenix; add GitHub Actions for lint/type-check/test on push.

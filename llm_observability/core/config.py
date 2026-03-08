@@ -238,6 +238,42 @@ class Settings(BaseSettings):
         description="JWT access token lifetime in minutes.",
     )
 
+    # ------------------------------------------------------------------ #
+    # OAuth2 social login (Google + GitHub)
+    # ------------------------------------------------------------------ #
+    google_client_id: str = Field(
+        default="",
+        description="Google OAuth2 client ID (from Google Cloud Console).",
+    )
+    google_client_secret: str = Field(
+        default="",
+        description="Google OAuth2 client secret.",
+    )
+    github_client_id: str = Field(
+        default="",
+        description="GitHub OAuth App client ID.",
+    )
+    github_client_secret: str = Field(
+        default="",
+        description="GitHub OAuth App client secret.",
+    )
+    oauth_redirect_base_url: str = Field(
+        default="http://localhost:8000",
+        description=(
+            "Base URL used to construct OAuth2 callback URIs. "
+            "E.g. https://api.example.com — callback will be "
+            "{base}/auth/google/callback or {base}/auth/github/callback."
+        ),
+    )
+    oauth_session_secret: str = Field(
+        default="change-me-in-production",
+        description=(
+            "Secret key for Starlette's cookie-based SessionMiddleware "
+            "(used internally for OAuth2 state/CSRF). "
+            "Set to a random 32-char string in production."
+        ),
+    )
+
 
 # Module-level singleton — import from here everywhere
 settings = Settings()

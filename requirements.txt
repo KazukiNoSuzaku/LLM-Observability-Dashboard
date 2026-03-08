@@ -43,6 +43,10 @@ python-multipart>=0.0.6
 # Authentication (JWT — optional; falls back to HMAC tokens if not installed)
 PyJWT>=2.8.0
 
+# OAuth2 social login (Google + GitHub via Authlib)
+Authlib>=1.3.0
+itsdangerous>=2.1.0        # required by Starlette SessionMiddleware (CSRF state)
+
 # Guardrails — PII detection & redaction (Microsoft Presidio)
 # Install separately — requires spaCy English model:
 #   pip install presidio-analyzer presidio-anonymizer
