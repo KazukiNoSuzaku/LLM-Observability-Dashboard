@@ -51,14 +51,18 @@ async def generate(
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> GenerateResponse:
     llm = ObservedLLM(model=request.model)
-    result = await llm.generate(
-        prompt=request.prompt,
-        template_name=request.template_name,
-        template_version=request.template_version,
-        variables=request.variables,
-        system=request.system,
-        feedback_score=request.feedback_score,
-    )
+    try:
+        result = await llm.generate(
+            prompt=request.prompt,
+            template_name=request.template_name,
+            template_version=request.template_version,
+            variables=request.variables,
+            system=request.system,
+            feedback_score=request.feedback_score,
+        )
+    except ValueError as exc:
+        # Raised by: guardrails block, missing template, missing prompt/template_name
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     if result["error"] and result["response"] is None:
         raise HTTPException(status_code=502, detail=result["error"])
@@ -262,11 +266,16 @@ async def ab_generate(
 
     async def _run(version: int) -> ABTestResult:
         llm = ObservedLLM()
+        # If a raw prompt is provided and the template uses a {prompt} placeholder,
+        # inject it automatically so callers don't have to repeat it in variables.
+        merged_vars: dict = {**(body.variables or {})}
+        if body.prompt and "prompt" not in merged_vars:
+            merged_vars["prompt"] = body.prompt
         try:
             result = await llm.generate(
                 template_name=name,
                 template_version=version,
-                variables=body.variables,
+                variables=merged_vars or None,
                 system=body.system,
             )
             return ABTestResult(

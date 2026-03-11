@@ -122,11 +122,12 @@ def create_access_token(username: str) -> tuple[str, int]:
         token = _jwt.encode(payload, _signing_key(), algorithm=_ALGORITHM)
         return token, expires_in
 
-    # HMAC fallback — not JWT but still cryptographically signed
-    sig = hmac.new(
-        _signing_key().encode(), username.encode(), hashlib.sha256
-    ).hexdigest()
-    return f"simple:{username}:{sig}", expires_in
+    # HMAC fallback — not JWT but still cryptographically signed.
+    # Include an expiry timestamp so tokens are not valid forever.
+    exp_ts = int((datetime.now(timezone.utc) + timedelta(seconds=expires_in)).timestamp())
+    msg = f"{username}:{exp_ts}".encode()
+    sig = hmac.new(_signing_key().encode(), msg, hashlib.sha256).hexdigest()
+    return f"simple:{username}:{exp_ts}:{sig}", expires_in
 
 
 def _verify_token(token: str) -> Optional[str]:
@@ -141,13 +142,21 @@ def _verify_token(token: str) -> Optional[str]:
         except Exception:
             return None
 
-    # HMAC fallback
+    # HMAC fallback — format: simple:{username}:{exp_ts}:{sig}
     if token.startswith("simple:"):
-        parts = token.split(":", 2)
-        if len(parts) == 3:
-            _, username, provided_sig = parts
+        parts = token.split(":", 3)
+        if len(parts) == 4:
+            _, username, exp_ts_str, provided_sig = parts
+            try:
+                exp_ts = int(exp_ts_str)
+            except ValueError:
+                return None
+            import time as _time
+            if _time.time() > exp_ts:
+                return None  # Token expired
+            msg = f"{username}:{exp_ts}".encode()
             expected_sig = hmac.new(
-                _signing_key().encode(), username.encode(), hashlib.sha256
+                _signing_key().encode(), msg, hashlib.sha256
             ).hexdigest()
             if hmac.compare_digest(provided_sig, expected_sig):
                 return username

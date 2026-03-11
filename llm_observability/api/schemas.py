@@ -148,11 +148,18 @@ class GenerateResponse(BaseModel):
 class ABTestRequest(BaseModel):
     """Payload for POST /api/v1/prompts/{name}/ab-generate."""
 
-    prompt: str = Field(..., min_length=1, description="Prompt to test across both versions")
     version_a: int = Field(..., ge=1, description="First template version")
     version_b: int = Field(..., ge=1, description="Second template version")
     variables: Optional[Dict[str, str]] = Field(
         None, description="Variables to substitute into template placeholders"
+    )
+    prompt: Optional[str] = Field(
+        None,
+        min_length=1,
+        description=(
+            "Optional raw prompt. If the template contains a {prompt} placeholder "
+            "this value is automatically injected into variables."
+        ),
     )
     system: Optional[str] = Field(None, description="Optional system prompt override")
 

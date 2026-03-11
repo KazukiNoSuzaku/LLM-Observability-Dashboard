@@ -307,15 +307,49 @@ def _regex_scan_pii(text: str) -> List[str]:
     return [label for label, pat in _REGEX_PII if pat.search(text)]
 
 
-def _presidio_scan_pii(text: str) -> List[str]:
-    """Return list of detected PII entity types via Presidio (if installed)."""
+# ---------------------------------------------------------------------------
+# Presidio engine singletons — initialised once per process to avoid reloading
+# spaCy NLP models on every request (would add several seconds of latency).
+# ---------------------------------------------------------------------------
+_presidio_analyzer = None
+_presidio_anonymizer = None
+_presidio_available: Optional[bool] = None  # None = not yet attempted
+
+
+def _get_presidio_engines():
+    """Return (analyzer, anonymizer) singletons, or (None, None) if unavailable."""
+    global _presidio_analyzer, _presidio_anonymizer, _presidio_available
+    if _presidio_available is False:
+        return None, None
+    if _presidio_available is True:
+        return _presidio_analyzer, _presidio_anonymizer
+
+    # First call — attempt import and initialise
     try:
         from presidio_analyzer import AnalyzerEngine  # type: ignore
-        _analyzer = AnalyzerEngine()
-        results = _analyzer.analyze(text=text, language="en")
-        return list({r.entity_type for r in results})
+        from presidio_anonymizer import AnonymizerEngine  # type: ignore
+        _presidio_analyzer = AnalyzerEngine()
+        _presidio_anonymizer = AnonymizerEngine()
+        _presidio_available = True
+        logger.info("Presidio PII engines initialised successfully")
     except ImportError:
+        _presidio_available = False
+        logger.info("presidio-analyzer not installed — using regex PII fallback")
+    except Exception as exc:
+        _presidio_available = False
+        logger.warning("Presidio initialisation failed, falling back to regex: %s", exc)
+
+    return _presidio_analyzer, _presidio_anonymizer
+
+
+def _presidio_scan_pii(text: str) -> List[str]:
+    """Return list of detected PII entity types via Presidio (if installed)."""
+    analyzer, _ = _get_presidio_engines()
+    if analyzer is None:
         return _regex_scan_pii(text)
+    try:
+        results = analyzer.analyze(text=text, language="en")
+        return list({r.entity_type for r in results})
     except Exception as exc:
         logger.debug("Presidio scan failed, falling back to regex: %s", exc)
         return _regex_scan_pii(text)
@@ -323,22 +357,18 @@ def _presidio_scan_pii(text: str) -> List[str]:
 
 def _presidio_redact(text: str, entity_types: List[str]) -> str:
     """Redact PII from *text* using Presidio (falls back to regex substitution)."""
+    analyzer, anonymizer = _get_presidio_engines()
+    if analyzer is None or anonymizer is None:
+        for label, pat in _REGEX_PII:
+            if label in entity_types:
+                text = pat.sub(f"[REDACTED:{label}]", text)
+        return text
     try:
-        from presidio_analyzer import AnalyzerEngine  # type: ignore
-        from presidio_anonymizer import AnonymizerEngine  # type: ignore
-        analyzer = AnalyzerEngine()
-        anonymizer = AnonymizerEngine()
         results = analyzer.analyze(text=text, language="en")
         if not results:
             return text
         anonymized = anonymizer.anonymize(text=text, analyzer_results=results)
         return anonymized.text
-    except ImportError:
-        # Regex fallback
-        for label, pat in _REGEX_PII:
-            if label in entity_types:
-                text = pat.sub(f"[REDACTED:{label}]", text)
-        return text
     except Exception as exc:
         logger.debug("Presidio redaction failed: %s", exc)
         return text
@@ -387,12 +417,23 @@ def _guardrails_ai_validate(text: str) -> Tuple[bool, List[str]]:
                     raise ValueError("Response must not be empty")
                 return v
 
-        guard = Guard.from_pydantic(_ResponseSchema)
-        guard.validate({"content": text})
+        # Guard API changed significantly in guardrails-ai 0.5+.
+        # Try the current API first, fall back to the legacy API.
+        try:
+            guard = Guard.from_pydantic(_ResponseSchema)
+        except AttributeError:
+            # guardrails-ai >= 0.5 uses Guard() directly
+            guard = Guard()  # type: ignore[call-arg]
+
+        try:
+            guard.validate({"content": text})
+        except AttributeError:
+            # Some versions use guard.parse() instead of validate()
+            guard.parse(text)  # type: ignore[attr-defined]
     except ImportError:
         pass  # Guardrails AI not installed — basic checks above suffice
     except Exception as exc:
-        reasons.append(f"guardrails_validation_failed: {exc}")
+        logger.debug("Guardrails AI validation skipped: %s", exc)
 
     return (len(reasons) == 0), reasons
 

@@ -227,10 +227,9 @@ class LLMRequest(Base):
     prompt_template = relationship("PromptTemplate", back_populates="requests")
 
     def __repr__(self) -> str:
-        return (
-            f"<LLMRequest id={self.id} model={self.model_name} "
-            f"latency={self.latency_ms:.0f}ms cost=${self.estimated_cost:.6f}>"
-        )
+        lat = f"{self.latency_ms:.0f}ms" if self.latency_ms is not None else "N/A"
+        cost = f"${self.estimated_cost:.6f}" if self.estimated_cost is not None else "N/A"
+        return f"<LLMRequest id={self.id} model={self.model_name} latency={lat} cost={cost}>"
 
 
 class OAuthUser(Base):

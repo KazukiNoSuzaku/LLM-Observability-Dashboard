@@ -41,6 +41,20 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Run startup tasks before yielding, then teardown tasks on shutdown."""
     # ---- startup ----
+
+    # Security checks — warn loudly about insecure defaults
+    if settings.oauth_session_secret == "change-me-in-production":
+        logger.warning(
+            "SECURITY WARNING: OAUTH_SESSION_SECRET is set to the default value. "
+            "Set a random 32-character string in your .env file before deploying."
+        )
+    if settings.auth_enabled and not settings.auth_secret_key:
+        logger.warning(
+            "SECURITY WARNING: AUTH_SECRET_KEY is not set. JWT signing key is "
+            "derived from AUTH_PASSWORD — set AUTH_SECRET_KEY explicitly in production "
+            "so tokens survive server restarts."
+        )
+
     logger.info("Initialising database …")
     await init_db()
     logger.info("Database ready.")
@@ -87,11 +101,13 @@ app = FastAPI(
 # session to store the OAuth2 state parameter for CSRF protection.
 app.add_middleware(SessionMiddleware, secret_key=settings.oauth_session_secret)
 
-# Allow all origins in development; restrict in production
+# CORS: Bearer-token auth (Authorization header) does not need allow_credentials=True.
+# allow_credentials=True is only for cookie/session auth and CANNOT be combined with
+# allow_origins=["*"] — browsers reject that combination.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

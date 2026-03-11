@@ -147,10 +147,12 @@ async def get_metrics_summary(
     latencies: List[float] = [row[0] for row in lat_result.all()]
 
     def _percentile(data: List[float], pct: float) -> float:
+        """Nearest-rank percentile on a pre-sorted list."""
         if not data:
             return 0.0
-        idx = max(0, int(len(data) * pct / 100) - 1)
-        return data[min(idx, len(data) - 1)]
+        # ceil(pct/100 * n) - 1, clamped to valid index range
+        idx = max(0, min(len(data) - 1, int(len(data) * pct / 100 + 0.999) - 1))
+        return data[idx]
 
     total_requests: int = agg.total_requests or 0
     error_count: int = int(agg.error_count or 0)
@@ -442,7 +444,11 @@ async def get_version_comparison(
             .order_by(LLMRequest.latency_ms)
         )
         latencies = [r[0] for r in lat_result.all()]
-        p95 = latencies[int(len(latencies) * 0.95)] if latencies else 0.0
+        if latencies:
+            idx = max(0, min(len(latencies) - 1, int(len(latencies) * 0.95 + 0.999) - 1))
+            p95 = latencies[idx]
+        else:
+            p95 = 0.0
 
         total = int(row.request_count or 0)
         errors = int(row.error_count or 0)

@@ -66,3 +66,8 @@ guardrails-ai>=0.5.0
 #   pip install nemoguardrails langchain-anthropic  (if using Anthropic for validation)
 # Then set GUARDRAILS_NEMO_ENABLED=true in .env
 # nemoguardrails>=0.9.0
+
+# ── Testing ──────────────────────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+anyio[trio]>=4.0.0

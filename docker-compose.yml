@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  # ── FastAPI backend ──────────────────────────────────────────────────────
+  api:
+    build: .
+    container_name: llm-obs-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - db_data:/app/data
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "sqlite+aiosqlite:///./data/llm_observability.db"
+      API_HOST: "0.0.0.0"
+      API_PORT: "8000"
+      PHOENIX_ENABLED: "false"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Streamlit dashboard ──────────────────────────────────────────────────
+  dashboard:
+    build: .
+    container_name: llm-obs-dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - db_data:/app/data
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "sqlite+aiosqlite:///./data/llm_observability.db"
+    depends_on:
+      api:
+        condition: service_healthy
+    command: >
+      streamlit run llm_observability/dashboard/app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+      --browser.gatherUsageStats=false
+
+volumes:
+  db_data:
+    driver: local

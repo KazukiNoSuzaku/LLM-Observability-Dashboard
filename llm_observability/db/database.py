@@ -18,15 +18,27 @@ logger = logging.getLogger(__name__)
 # Engine
 # ---------------------------------------------------------------------------
 _connect_args: dict = {}
+_engine_kwargs: dict = {"echo": False, "future": True}
+
 if "sqlite" in settings.database_url:
     # SQLite requires check_same_thread=False when used with threads/asyncio
     _connect_args = {"check_same_thread": False}
+else:
+    # PostgreSQL: configure a sensible connection pool for production use.
+    # pool_pre_ping verifies connections before checkout to avoid stale errors.
+    _engine_kwargs.update(
+        {
+            "pool_size": 10,
+            "max_overflow": 20,
+            "pool_pre_ping": True,
+            "pool_recycle": 1800,  # recycle connections every 30 min
+        }
+    )
 
 engine = create_async_engine(
     settings.database_url,
-    echo=False,          # Set True to log all SQL statements
-    future=True,
     connect_args=_connect_args,
+    **_engine_kwargs,
 )
 
 # ---------------------------------------------------------------------------

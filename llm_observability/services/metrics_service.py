@@ -42,13 +42,17 @@ def _timeseries_sql(bucket_minutes: int) -> str:
             ORDER BY bucket
         """
     else:
-        # SQLite-compatible bucketing
+        # SQLite-compatible bucketing.
+        # IMPORTANT: avoid any ':digit' pattern in string literals — SQLAlchemy's
+        # text() parser treats ':word' sequences as named bind parameters.
+        # Use char(58) (ASCII colon) instead of literal ':' before digits.
         return f"""
             SELECT
-                strftime('%Y-%m-%dT%H:', timestamp)
+                strftime('%Y-%m-%dT%H', timestamp)
+                || char(58)
                 || printf('%02d', (CAST(strftime('%M', timestamp) AS INTEGER)
                                   / {bucket_minutes}) * {bucket_minutes})
-                || ':00Z' AS bucket,
+                || char(58) || '00Z' AS bucket,
                 COUNT(*)                                               AS request_count,
                 AVG(CASE WHEN is_error = 0 THEN latency_ms END)       AS avg_latency_ms,
                 SUM(COALESCE(estimated_cost, 0))                       AS total_cost,
