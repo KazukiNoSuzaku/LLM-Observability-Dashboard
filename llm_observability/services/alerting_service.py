@@ -267,9 +267,6 @@ class AlertingService:
             warning → FF9900 (amber)
             info    → 6264A7 (Teams purple)
         """
-        color_map = {"danger": "FF4444", "warning": "FF9900", "info": "6264A7"}
-        theme_color = color_map.get(color_name, "6264A7")
-
         # Build Adaptive Card fact set from details dict
         facts = [
             {"title": str(k), "value": str(v)}

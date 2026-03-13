@@ -8,7 +8,6 @@ Run:
     streamlit run llm_observability/dashboard/app.py
 """
 
-import io
 import os
 import time
 from contextlib import contextmanager
@@ -534,7 +533,8 @@ def _spark(values: list, color: str = "#6366f1") -> str:
     W, H = 72, 28
     mn, mx = min(vals), max(vals)
     if mx == mn:
-        mn -= 1; mx += 1
+        mn -= 1
+        mx += 1
     pts = [
         f"{i / (len(vals)-1) * W:.1f},{H - (v - mn) / (mx - mn) * H:.1f}"
         for i, v in enumerate(vals)
