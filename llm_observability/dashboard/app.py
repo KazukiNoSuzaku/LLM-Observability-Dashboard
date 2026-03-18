@@ -59,10 +59,14 @@ else:
 DB_PATH = _SYNC_URL.split("///")[-1] if not _IS_POSTGRES else ""
 
 try:
+    _connect_args: dict = {"connect_timeout": 5} if _IS_POSTGRES else {
+        "check_same_thread": False,
+        "timeout": 5,
+    }
     _sync_engine = create_engine(
         _SYNC_URL,
         pool_pre_ping=True,
-        connect_args={} if _IS_POSTGRES else {"check_same_thread": False},
+        connect_args=_connect_args,
     )
 except Exception:
     _sync_engine = None  # type: ignore[assignment]

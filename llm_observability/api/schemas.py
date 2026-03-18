@@ -1,7 +1,7 @@
 """Pydantic request/response schemas for the FastAPI layer."""
 
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -92,7 +92,7 @@ class GenerateRequest(BaseModel):
     template_version: Optional[int] = Field(
         None, ge=1, description="Pin to a specific version; omit to use latest"
     )
-    variables: Optional[Dict[str, str]] = Field(
+    variables: Optional[Dict[str, Any]] = Field(
         None,
         description="Values to substitute into template {placeholders}",
     )
@@ -150,7 +150,7 @@ class ABTestRequest(BaseModel):
 
     version_a: int = Field(..., ge=1, description="First template version")
     version_b: int = Field(..., ge=1, description="Second template version")
-    variables: Optional[Dict[str, str]] = Field(
+    variables: Optional[Dict[str, Any]] = Field(
         None, description="Variables to substitute into template placeholders"
     )
     prompt: Optional[str] = Field(

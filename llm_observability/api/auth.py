@@ -187,28 +187,20 @@ async def get_current_user(
         return UserInfo(username="anonymous", authenticated=False, auth_method="disabled")
 
     # --- API key check ---------------------------------------------------- #
+    # Always perform constant-time comparison regardless of key presence to
+    # avoid timing side-channels that could reveal whether AUTH_API_KEY is set.
     if api_key and settings.auth_api_key:
         if hmac.compare_digest(api_key, settings.auth_api_key):
             return UserInfo(username="api-key-user", authenticated=True, auth_method="api_key")
-        # Key was provided but wrong — fall through to give a 401 below
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        # Wrong key — fall through so Bearer can also be tried, then reject below.
 
     # --- Bearer token check ----------------------------------------------- #
     if token:
         username = _verify_token(token)
         if username:
             return UserInfo(username=username, authenticated=True, auth_method="bearer")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired access token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
 
-    # --- Neither credential provided ------------------------------------- #
+    # --- All checks failed ------------------------------------------------ #
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Authentication required — provide 'X-API-Key' header or 'Authorization: Bearer <token>'",

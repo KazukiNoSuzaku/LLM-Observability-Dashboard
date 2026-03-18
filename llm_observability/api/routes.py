@@ -264,6 +264,16 @@ async def ab_generate(
 ) -> ABTestResponse:
     import asyncio
 
+    # Verify the template exists before launching both async branches.
+    # This gives callers a clean 404 rather than two error-filled ABTestResults.
+    for ver in (body.version_a, body.version_b):
+        tpl = await crud.get_prompt_template(db, name=name, version=ver)
+        if tpl is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Prompt template '{name}' version {ver} not found or inactive",
+            )
+
     async def _run(version: int) -> ABTestResult:
         llm = ObservedLLM()
         # If a raw prompt is provided and the template uses a {prompt} placeholder,

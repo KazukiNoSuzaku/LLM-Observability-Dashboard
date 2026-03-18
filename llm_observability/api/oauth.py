@@ -244,7 +244,9 @@ async def github_callback(request: Request) -> JSONResponse:
         return _err("GitHub did not return required user information.", 400)
 
     # Fallback email for users with entirely hidden emails
-    email = email or f"{username}@github.invalid"
+    # github-noreply.com is the domain GitHub itself uses for no-reply addresses,
+    # making it a recognisable and non-deliverable placeholder.
+    email = email or f"{username}@users.noreply.github.com"
 
     user = await _upsert_oauth_user("github", provider_user_id, email, username)
     logger.info("GitHub OAuth login: %s (%s)", user.username, user.email)

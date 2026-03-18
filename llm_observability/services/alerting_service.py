@@ -26,6 +26,8 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from llm_observability.core.config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -139,7 +141,7 @@ class AlertingService:
             payload["blocks"].append({"type": "section", "fields": fields})
 
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=settings.alert_webhook_timeout_seconds) as client:
                 resp = await client.post(url, json=payload)
                 if resp.status_code not in (200, 204):
                     logger.warning("Slack webhook returned %s: %s", resp.status_code, resp.text)
@@ -179,7 +181,7 @@ class AlertingService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=settings.alert_webhook_timeout_seconds) as client:
                 resp = await client.post(url, json=payload)
                 if resp.status_code not in (200, 204):
                     logger.warning(
@@ -228,7 +230,7 @@ class AlertingService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=settings.alert_webhook_timeout_seconds) as client:
                 resp = await client.post(
                     "https://events.pagerduty.com/v2/enqueue",
                     json=payload,
@@ -313,7 +315,7 @@ class AlertingService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=settings.alert_webhook_timeout_seconds) as client:
                 resp = await client.post(url, json=payload)
                 # Teams returns 200 with body "1" on success
                 if resp.status_code not in (200, 202, 204):

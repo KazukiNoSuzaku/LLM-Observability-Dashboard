@@ -496,7 +496,9 @@ def _get_nemo_rails():
         logger.info("NeMo Guardrails LLMRails initialized")
         return _nemo_rails
     except Exception as exc:
-        logger.error("Failed to initialize NeMo Guardrails: %s", exc)
+        logger.warning(
+            "Failed to initialize NeMo Guardrails (running without NeMo rails): %s", exc
+        )
         return None
 
 

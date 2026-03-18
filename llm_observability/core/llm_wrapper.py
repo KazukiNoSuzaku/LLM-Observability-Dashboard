@@ -101,7 +101,7 @@ class ObservedLLM:
         # Prompt version control
         template_name: Optional[str] = None,
         template_version: Optional[int] = None,
-        variables: Optional[Dict[str, str]] = None,
+        variables: Optional[Dict[str, Any]] = None,
         # Common options
         system: Optional[str] = None,
         feedback_score: Optional[float] = None,
@@ -210,7 +210,23 @@ class ObservedLLM:
                 error_text = str(exc)
                 span.set_attribute("error", True)
                 span.set_attribute("error.message", error_text)
-                logger.error("LLM request failed [trace=%s]: %s", trace_id, exc)
+                # Classify error for better diagnostics
+                exc_type = type(exc).__name__
+                span.set_attribute("error.type", exc_type)
+                if "auth" in exc_type.lower() or "authentication" in exc_type.lower():
+                    logger.error(
+                        "LLM auth error [trace=%s] — check API key: %s", trace_id, exc
+                    )
+                elif "ratelimit" in exc_type.lower() or "rate_limit" in exc_type.lower():
+                    logger.warning(
+                        "LLM rate limit [trace=%s] model=%s: %s", trace_id, self.model, exc
+                    )
+                elif "connection" in exc_type.lower() or "timeout" in exc_type.lower():
+                    logger.warning(
+                        "LLM network error [trace=%s]: %s", trace_id, exc
+                    )
+                else:
+                    logger.error("LLM request failed [trace=%s]: %s", trace_id, exc)
 
             finally:
                 latency_ms = (time.monotonic() - start_time) * 1000
@@ -302,7 +318,7 @@ class ObservedLLM:
 
         message = await client.messages.create(**call_kwargs)
         return (
-            message.content[0].text,
+            message.content[0].text or "",
             message.usage.input_tokens,
             message.usage.output_tokens,
         )

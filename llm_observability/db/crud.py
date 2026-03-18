@@ -431,22 +431,27 @@ async def get_version_comparison(
     )
     rows = agg_result.all()
 
+    # Fetch all non-error latencies for every version in one query (avoids N+1).
+    lat_result = await db.execute(
+        select(LLMRequest.prompt_template_version, LLMRequest.latency_ms)
+        .where(LLMRequest.prompt_template_name == name)
+        .where(LLMRequest.timestamp >= since)
+        .where(LLMRequest.latency_ms.isnot(None))
+        .where(LLMRequest.is_error == False)  # noqa: E712
+        .where(LLMRequest.prompt_template_version.isnot(None))
+        .order_by(LLMRequest.prompt_template_version, LLMRequest.latency_ms)
+    )
+    latencies_by_version: Dict[int, List[float]] = {}
+    for ver, lat in lat_result.all():
+        latencies_by_version.setdefault(ver, []).append(lat)
+
     comparison: List[Dict[str, Any]] = []
     for row in rows:
-        # Compute p95 latency in Python for this version
-        lat_result = await db.execute(
-            select(LLMRequest.latency_ms)
-            .where(LLMRequest.prompt_template_name == name)
-            .where(LLMRequest.prompt_template_version == row.version)
-            .where(LLMRequest.timestamp >= since)
-            .where(LLMRequest.latency_ms.isnot(None))
-            .where(LLMRequest.is_error == False)  # noqa: E712
-            .order_by(LLMRequest.latency_ms)
-        )
-        latencies = [r[0] for r in lat_result.all()]
-        if latencies:
-            idx = max(0, min(len(latencies) - 1, int(len(latencies) * 0.95 + 0.999) - 1))
-            p95 = latencies[idx]
+        lats = latencies_by_version.get(row.version, [])
+        if lats:
+            # Nearest-rank p95: results are already sorted by the ORDER BY above.
+            idx = min(len(lats) - 1, max(0, int(len(lats) * 0.95) - 1))
+            p95 = lats[idx]
         else:
             p95 = 0.0
 

@@ -24,6 +24,14 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
 
   # ── Streamlit dashboard ──────────────────────────────────────────────────
   dashboard:
@@ -47,6 +55,14 @@ services:
       --server.address=0.0.0.0
       --server.headless=true
       --browser.gatherUsageStats=false
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
 
 volumes:
   db_data:

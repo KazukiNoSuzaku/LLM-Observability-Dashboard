@@ -118,6 +118,10 @@ class Settings(BaseSettings):
         default=300,
         description="Minimum seconds between repeated alerts of the same type",
     )
+    alert_webhook_timeout_seconds: float = Field(
+        default=10.0,
+        description="HTTP timeout (seconds) for outbound webhook alert calls",
+    )
 
     # ------------------------------------------------------------------ #
     # Per-model alert threshold overrides
@@ -136,7 +140,7 @@ class Settings(BaseSettings):
         import json
         try:
             return json.loads(self.model_alert_thresholds_json)
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             return {}
 
     # ------------------------------------------------------------------ #
