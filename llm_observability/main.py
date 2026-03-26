@@ -18,7 +18,7 @@ from llm_observability.api.auth import router as auth_router
 from llm_observability.api.oauth import router as oauth_router
 from llm_observability.api.routes import router
 from llm_observability.core.config import settings
-from llm_observability.db.database import init_db
+from llm_observability.db.database import engine, init_db
 from llm_observability.services.tracing_service import TracingService
 
 # ---------------------------------------------------------------------------
@@ -78,6 +78,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ---- shutdown ----
     logger.info("Shutting down LLM Observability API …")
+    await engine.dispose()
+    logger.info("Database connections closed.")
 
 
 # ---------------------------------------------------------------------------
@@ -147,5 +149,18 @@ async def root() -> JSONResponse:
 
 @app.get("/health", tags=["ops"])
 async def health() -> dict:
-    """Liveness probe — returns 200 when the service is running."""
-    return {"status": "healthy", "service": "llm-observability"}
+    """Readiness probe — returns 200 when the service and DB are reachable."""
+    from sqlalchemy import text as sa_text
+
+    from llm_observability.db.database import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(sa_text("SELECT 1"))
+        return {"status": "healthy", "service": "llm-observability", "database": "connected"}
+    except Exception as exc:
+        logger.warning("Health check DB probe failed: %s", exc)
+        return JSONResponse(
+            {"status": "degraded", "service": "llm-observability", "database": "unreachable"},
+            status_code=503,
+        )

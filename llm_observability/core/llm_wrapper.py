@@ -317,8 +317,9 @@ class ObservedLLM:
             call_kwargs["system"] = system
 
         message = await client.messages.create(**call_kwargs)
+        text = message.content[0].text if message.content else ""
         return (
-            message.content[0].text or "",
+            text or "",
             message.usage.input_tokens,
             message.usage.output_tokens,
         )
@@ -344,8 +345,9 @@ class ObservedLLM:
             max_tokens=self.max_tokens,
             messages=messages,
         )
+        text = resp.choices[0].message.content if resp.choices else ""
         return (
-            resp.choices[0].message.content or "",
+            text or "",
             resp.usage.prompt_tokens,
             resp.usage.completion_tokens,
         )
@@ -411,8 +413,9 @@ class ObservedLLM:
             messages=messages,
             max_tokens=self.max_tokens,
         )
+        text = resp.choices[0].message.content if resp.choices else ""
         return (
-            resp.choices[0].message.content or "",
+            text or "",
             resp.usage.prompt_tokens,
             resp.usage.completion_tokens,
         )

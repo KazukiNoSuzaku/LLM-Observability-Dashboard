@@ -140,7 +140,11 @@ class Settings(BaseSettings):
         import json
         try:
             return json.loads(self.model_alert_thresholds_json)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError) as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Failed to parse MODEL_ALERT_THRESHOLDS_JSON, using defaults: %s", exc
+            )
             return {}
 
     # ------------------------------------------------------------------ #

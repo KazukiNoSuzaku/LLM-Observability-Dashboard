@@ -183,7 +183,7 @@ async def google_callback(request: Request) -> JSONResponse:
     username: str = (
         user_info.get("name")
         or user_info.get("given_name")
-        or email.split("@")[0]
+        or (email.split("@")[0] if email else "google-user")
     )
 
     if not provider_user_id or not email:
