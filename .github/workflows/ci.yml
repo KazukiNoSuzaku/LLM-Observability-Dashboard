@@ -49,7 +49,7 @@ jobs:
       - name: Lint with ruff
         run: |
           pip install ruff
-          ruff check llm_observability/ --select=E,F,W --ignore=E501 || true
+          ruff check llm_observability/ --select=E,F,W --ignore=E501
 
       - name: Run tests
         env:
